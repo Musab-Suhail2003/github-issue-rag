@@ -17,7 +17,8 @@ is documented in the README.
 
 > **Measured (stage 0):** the window holds **84,877** issues, not the ~40k first
 > estimated. At 384 dims float32 that is **~130MB** of vectors, not 60MB. Still
-> viable for brute-force numpy. See NOTES.md.
+> viable for brute-force numpy, and it fits in a free-tier Space's RAM. See
+> NOTES.md.
 
 **Fetch both open and closed issues.** Duplicates are closed by definition, so the
 entire test set lives in the closed set. A fetch restricted to open issues returns
@@ -49,6 +50,7 @@ in the `issues` table and drop the pair if it does not.
 > no pyenv, no uv. Verified that the whole stack has 3.14 wheels
 > (`torch-2.14.0-cp314-cp314-manylinux_2_28_x86_64.whl`; glibc here is 2.44 vs the
 > 2.28 required). One venv, one interpreter, no version manager needed.
+> The Space pins its own Python version independently — do not assume 3.14 there.
 
 ## Rules
 
@@ -76,7 +78,13 @@ issue-rag/
 ├── schema.sql             # MariaDB DDL
 ├── app.py                 # Streamlit UI (stage 8)
 ├── scripts/
-│   └── probe.py           # throwaway corpus probe, deleted after stage 0
+│   ├── probe.py           # throwaway corpus probe, deleted after stage 0
+│   └── export.py          # MariaDB → serving artifacts (stage 8)
+├── artifacts/             # generated, git-LFS'd to the Space — not in main repo
+│   ├── embeddings.npy     #   float32 matrix, row order matches issue_ids.npy
+│   ├── issue_ids.npy
+│   ├── issues.sqlite      #   title, body, labels, dates, url
+│   └── bm25.pkl
 └── src/
     ├── db.py              # connection handling, idempotent upserts
     ├── fetch.py           # GitHub GraphQL ingestion → MariaDB
@@ -147,6 +155,44 @@ stage is not finished. Prompt me for the numbers if I forget.
 - **7.** Q&A layer over issue comment threads (chunking matters here).
 - **8.** Streamlit UI + README.
 - **9.** Tool-calling triage agent (`search_duplicates`, `fetch_issue`, `suggest_labels`).
+
+## Deployment architecture
+
+The project splits into a **batch side** and a **serving side**. This split is a
+hard constraint, not a stage-8 concern — code written from stage 3 onward must
+respect it.
+
+**Batch (offline, my machine or a GitHub Actions runner):** fetch from the GitHub
+API → MariaDB → embed → fine-tune → evaluate → `scripts/export.py` writes
+`artifacts/` → git push to the Hugging Face Space.
+
+**Serving (Hugging Face Space, always on):** Streamlit process loads `artifacts/`
+into RAM at startup, embeds the visitor's query, retrieves, reranks, renders.
+
+```
+visitor's browser  <--websocket-->  Hugging Face Space
+                                    (models + embeddings in RAM,
+                                     reads artifacts/ only)
+
+GitHub API --> batch pipeline --> artifacts/ --> git push --> Space
+               (local or CI)
+```
+
+Rules this implies:
+
+- **Nothing in the serving path touches MariaDB, the GitHub API, or any secret.**
+  It reads four files and answers queries. No external dependency can break the
+  demo mid-interview.
+- Streamlit is not a separate frontend. One Python process renders the UI
+  server-side over a websocket. There is no API layer, no client build, no CORS.
+- The corpus is a frozen snapshot. Display the snapshot date and issue count in
+  the UI so it reads as deliberate rather than stale.
+- `fetch.py` must support a `--since` flag and store the last fetch timestamp, so
+  refreshes are incremental rather than full re-fetches.
+- The hosted demo uses a smaller reranker than the eval does — `bge-reranker-base`
+  or `ms-marco-MiniLM-L-6-v2` instead of `bge-reranker-v2-m3` (~568M params, too
+  slow on 2 vCPU). Record both models' numbers in NOTES.md; the accuracy/latency
+  tradeoff is a deliberate serving decision and belongs in the README.
 
 ## Domain notes
 
