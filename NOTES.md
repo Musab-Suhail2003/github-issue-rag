@@ -187,6 +187,13 @@ x canonical resolves to an ingested issue  85.6%
 USABLE PAIRS                          3,194     (stage 0 estimated ~2,507)
 ```
 
+> **Corrected in stage 2.** This 3,194 counts pairs the *eval cannot use*. 678 of
+> them (8.4%) have a canonical created **after** the duplicate — maintainers do
+> sometimes close the older issue as a duplicate of the newer one. A time-aware
+> retriever can never return those, so the real usable count is **2,516**, and
+> stage 0's estimate of 2,507 was almost exactly right. The "27% conservative"
+> claim below was comparing the wrong quantity.
+
 Pattern split: `dup_of` 1,871 · `dup_colon` 1,784 · `tracked_in` 78 ·
 `NO_MATCH` 4,312 (53.6%).
 
@@ -259,3 +266,97 @@ crash, but that driver does not belong near untrusted input.
   briefly muddied the diagnosis.
 - `scripts/probe.py` deleted per CLAUDE.md. It survives in git history at
   commit `67b90a9`, and its regex battery is preserved above.
+
+---
+
+## Stage 2 — Eval harness + test-set extraction (2026-09-18)
+
+**Written by Claude at the user's explicit request**, overriding CLAUDE.md rule 3
+("I write eval.py myself"). Recorded because the rule still stands for
+`src/fusion.py`.
+
+**Files:** `src/testset.py` (extraction → frozen `testset.json`), `src/eval.py`
+(metrics), `db.issue_text()` (shared text composition).
+
+### Why extraction and evaluation are separate files
+
+Extraction is regex over 208,753 comments and produces a **frozen, committed
+artifact**. Evaluation reads it and runs many times. If extraction ran inside
+every eval, editing the regex battery would silently move the benchmark and the
+stage-to-stage numbers in this file would stop being comparable. The whole value
+of an ablation table is that only one thing changes at a time.
+
+### Extraction funnel (8,045 duplicate-marked issues)
+
+| stage | n | share |
+|---|---|---|
+| no canonical in comment text | 4,312 | 53.6% |
+| canonical not in corpus (pre-2024 or a PR) | 539 | 6.7% |
+| **canonical newer than the query** | **678** | **8.4%** |
+| **usable** | **2,516** | **31.3%** |
+
+Pattern hits: `dup_of` 1,871 · `dup_colon` 1,784 · `tracked_in` 78.
+
+**The 8.4% time-ordering drop is new information and it corrects stage 1.**
+Maintainers sometimes close the *older* issue as a duplicate of the newer one.
+Those pairs are unusable for a time-aware eval by construction: no retriever
+restricted to issues predating the query could ever return the answer. Keeping
+them would have depressed every future recall number by ~8% for a reason that
+has nothing to do with retrieval quality — and, worse, it would have looked like
+a model problem.
+
+126 pairs have a canonical that is itself marked duplicate (A→B→C chains). Left
+intact: B is a real corpus issue and retrieving it for query A is exactly what a
+maintainer labelled correct. Recorded because it is a defensible-either-way call.
+
+### Split
+
+**Chronological, 80/20 — train 2,012, test 504.** Not random, for two reasons:
+
+1. Stage 5b fine-tunes on duplicate pairs. A random split would let it train on
+   pairs that postdate its own test queries — leakage that would inflate 5b and
+   nothing else, making the ablation table lie about exactly the stage it was
+   built to measure.
+2. It mirrors deployment: learn from history, answer new issues.
+
+### Harness self-check — stage 2's number
+
+There is no retriever yet, so the number that matters is whether the metric is
+correct. Two synthetic retrievers bracket it:
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| **oracle** (returns the answer first) | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| **random** (sampled from issues predating the query) | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+
+The oracle is a unit test, not a baseline: if it were not exactly 1.0 the harness
+would be broken and every later number noise. The random floor is 0.0000 because
+10 draws from a ~50k-issue candidate pool gives ~0.1 expected hits across 504
+queries — so **any** real signal in stage 3 will be visible.
+
+### Statistical precision — read this before trusting small deltas
+
+With **n = 504** test pairs, a measured recall of ~0.30 has a standard error of
+about **±2.0 points**, so a 95% CI is roughly ±4 points. **Differences smaller
+than ~4 points between stages are not significant.** Worth stating now, before
+there is any temptation to narrate a 1-point improvement as a win. If a later
+stage needs finer resolution, the lever is a larger test fraction, not a better
+story.
+
+### Retriever contract
+
+    retriever(query_text: str, before_date: datetime, n: int) -> list[int]
+
+`before_date` is enforced, not advisory. A retriever ignoring it scores well here
+and is worthless in production, because it answers with issues that did not exist
+when the question was asked. `eval.py` additionally strips the query issue from
+any result list, so a bug of that shape shows up as a bad score rather than a
+suspiciously good one.
+
+MRR is truncated at `max(ks)` — a canonical ranked below the retrieved window
+contributes 0, not an unknown `1/rank`. Cross-stage MRR comparisons are only
+valid at the same depth.
+
+`db.issue_text(title, body)` lives in the data layer so eval and stage 3's
+`embed.py` cannot drift apart. If the query side and document side composed text
+differently, the numbers would be measuring that discrepancy as much as the model.

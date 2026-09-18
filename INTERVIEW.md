@@ -25,7 +25,8 @@ The ablation table is the deliverable.
 |---|---|
 | corpus | **84,942** issues ingested, created ≥ 2024-01-01 |
 | duplicate-marked | 8,045 |
-| usable labelled pairs | **3,194** (measured in DB; stage 0 estimated 2,507) |
+| usable labelled pairs | **2,516** (3,194 before enforcing time-ordering) |
+| test split | 504 pairs, chronological 80/20 |
 | canonical extractable from comments | 46.4% |
 | canonical is an Issue, not a PR | 100% |
 | canonical inside the date window | 85.6% |
@@ -284,6 +285,83 @@ one place where schemaless beats typed columns, and it's worth being able to say
   `issues`, so the parent has to land first within the transaction.
 - **NUL bytes stripped from bodies.** They show up in pasted terminal output and
   upset both the connector and downstream tokenisers.
+
+---
+
+## Stage 2 — decisions you must be able to defend
+
+### "Walk me through your evaluation setup."
+
+2,516 labelled (duplicate → canonical) pairs, split chronologically 80/20 into
+2,012 train and 504 test. Metrics are recall@1/5/10 and MRR. Every query is
+time-filtered: the retriever only sees issues created before the query issue.
+
+Two details that make it trustworthy rather than just plausible:
+
+- **The extraction is frozen.** Pairs are extracted once into a committed
+  `testset.json`; evaluation reads that file. If extraction ran inside the eval,
+  editing a regex would silently move the benchmark and my stage-to-stage numbers
+  would stop being comparable. An ablation table is only worth anything if one
+  thing changes at a time.
+- **The harness is unit-tested by an oracle retriever** that returns the correct
+  answer first. It must score exactly 1.0. If it doesn't, the metric is broken
+  and every number downstream is noise. I also run a random retriever to
+  establish the floor.
+
+### "Why a chronological split instead of a random one?"
+
+Because stage 5b fine-tunes the embedding model on duplicate pairs. With a random
+split it would train on pairs that postdate its own test queries — leakage that
+would inflate exactly the stage the ablation table exists to measure, and nothing
+else. Chronological also mirrors deployment: learn from history, answer new
+issues.
+
+### "You threw out another 678 pairs. Why?"
+
+Because their canonical was created **after** the duplicate. Maintainers
+sometimes close the *older* issue as a duplicate of the newer one.
+
+A time-aware retriever can never return those, by construction. Scoring against
+them would have depressed every stage's recall by ~8 percentage points for a
+reason that has nothing to do with retrieval quality — and it would have looked
+like a model problem, so I'd have spent time tuning against an artefact of the
+labels.
+
+This also corrected an earlier number of mine. Stage 1 reported 3,194 usable
+pairs and concluded the stage 0 probe had been 27% conservative. Once
+time-ordering is enforced it's 2,516, and the probe's estimate of 2,507 was
+almost exactly right. **I was comparing the wrong quantity.** Worth saying out
+loud in an interview — catching your own measurement error is a better signal
+than never having made one.
+
+### "How confident are you in a one-point improvement?"
+
+Not at all, and the numbers say so. With n=504 and recall around 0.30, the
+standard error is roughly ±2 points, so a 95% interval is about ±4. **Anything
+under ~4 points between stages is not significant.**
+
+I wrote that into NOTES.md before running any retriever, specifically so there
+would be no temptation later to narrate noise as a win. If a stage needs finer
+resolution the lever is a bigger test split, not a better story.
+
+### "What stops a retriever from cheating?"
+
+The `before_date` argument is part of the required signature, so it can't be
+forgotten silently. On top of that, `eval.py` strips the query issue itself from
+every result list — a retriever with a time-filter bug then shows up as a *bad*
+score rather than a suspiciously good one. Failures should be loud.
+
+`db.issue_text()` composes title and body in one place, shared by the eval and
+the embedder, so the query side and document side can't drift apart. Otherwise
+the numbers would partly be measuring that discrepancy instead of the model.
+
+### Honest caveat to raise yourself
+
+I wrote this harness; the project owner originally intended to. If asked what I'd
+scrutinise hardest in someone else's eval code, the answer is the same three
+things I built guards for: **is the time filter real, is the metric unit-tested,
+and is the test set frozen.**
+
 
 ---
 

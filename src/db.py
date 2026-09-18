@@ -151,6 +151,25 @@ def replace_labels(conn, issue_numbers: Iterable[int], rows: Sequence[tuple]) ->
     return _bulk(conn, "issue_labels", ("issue_number", "label"), rows, ignore=True)
 
 
+# ---------------------------------------------------------------- text
+
+def issue_text(title: str | None, body: str | None, max_chars: int = 8000) -> str:
+    """The canonical text representation of an issue.
+
+    Lives here, in the data layer, so that eval.py and embed.py cannot drift
+    apart. If the query side and the document side compose text differently, the
+    retrieval numbers are measuring that discrepancy as much as the model.
+
+    Truncation is a floor-level guard against the handful of issues with enormous
+    pasted logs; bge-small's context window is 512 tokens, so stage 3 will
+    truncate far more aggressively than this. Field-aware handling is stage 6.
+    """
+    parts = [(title or "").strip()]
+    if body:
+        parts.append(body.strip())
+    return "\n\n".join(p for p in parts if p)[:max_chars]
+
+
 # ---------------------------------------------------------------- state
 
 def get_state(conn, key: str) -> str | None:
