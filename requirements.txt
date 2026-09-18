@@ -1,0 +1,4 @@
+# Stage 0 (corpus probe). Dependencies are added as each stage needs them,
+# not up front -- the file doubles as a record of what each stage actually cost.
+requests==2.34.2
+python-dotenv==1.2.3

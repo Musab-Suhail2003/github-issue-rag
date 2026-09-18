@@ -1,0 +1,11 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# probe/scratch output
+*.json.gz
+probe_out/
