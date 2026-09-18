@@ -35,6 +35,8 @@ The ablation table is the deliverable.
 | comments ingested | 208,753 (avg 2.56/issue) |
 | database on disk | ~400MB (+226MB embeddings) |
 | **dense baseline** | **recall@10 0.2778, MRR 0.1627** |
+| hybrid (BM25+RRF) | recall@10 0.2560 — *no improvement* |
+| union ceiling @50 | 0.4206 (57.9% found by neither) |
 
 ---
 
@@ -286,6 +288,116 @@ one place where schemaless beats typed columns, and it's worth being able to say
   `issues`, so the parent has to land first within the transaction.
 - **NUL bytes stripped from bodies.** They show up in pasted terminal output and
   upset both the connector and downstream tokenisers.
+
+---
+
+## Stage 4 — decisions you must be able to defend
+
+**This is the most valuable stage to talk about, because it failed.**
+
+### "So you built a hybrid retriever and it didn't work?"
+
+Correct. Dense alone gets recall@10 = 0.2778; the best hybrid gets 0.2560. It
+lost 2.2 points. Every gap is inside my ±4-point significance band, so the honest
+claim is that **stage 4 changed nothing measurable**, and dense-only is still the
+retriever of record.
+
+The reason that's worth presenting rather than hiding: I found out *why*, and the
+answer is structural rather than a tuning mistake.
+
+### "How do you know it wasn't just badly tuned?"
+
+I measured the ceiling before touching any knob. At depth 50, across 504 queries:
+
+```
+found by both   120  (23.8%)
+dense only       77  (15.3%)
+BM25 only        15   (3.0%)   <- everything fusion could possibly gain
+neither         292  (57.9%)
+```
+
+BM25 finds **15 pairs** dense misses. A perfect fusion — one that always
+promoted the right answer to the top — gains at most 3 points at depth 50, and
+less by depth 10. Against that, merging a weaker ranked list costs dense's own
+correct answers their positions.
+
+So the trade is structurally bad, not badly configured. **Tuning a parameter
+whose maximum payoff is 3 points isn't where effort belongs** — and knowing that
+took one diagnostic instead of a week of grid search.
+
+That's the answer I'd want to give to "tell me about a time you decided *not* to
+optimise something."
+
+### "Doesn't BM25 catch identifiers? That was the whole premise."
+
+It does. That's what makes the result credible rather than just disappointing.
+Its 15 unique saves are exactly the textbook cases:
+
+> #307563 `[Unhandled Error] potential listener LEAK detected…`
+> → #304828 `[042/d9f] potential listener LEAK in chatTerminalToolProgress…`
+
+Literal phrase match, no semantic overlap in the titles. BM25 works precisely as
+advertised — it just doesn't fire often enough on this corpus to pay for what
+fusion costs elsewhere.
+
+I'd also point out I **wrote the prediction down first**, in stage 3's notes:
+"helps, but less than the 'BM25 catches identifiers' story suggests." That turned
+out directionally right and still too optimistic. Recording it beforehand is what
+makes it a result instead of a story told afterwards.
+
+### "Why did you write your own BM25?"
+
+Because `rank_bm25` was unusable here, and I verified my replacement rather than
+trusting it.
+
+`BM25Okapi.get_scores` recomputes the document-length normalisation across all
+84,942 documents for every query token. An issue query is ~290 tokens, so that's
+**2.7s per query** — 22 minutes per eval, over two hours for the seven configs I
+needed.
+
+Everything except the idf lookup depends only on the document, so it's
+precomputable. I built an inverted index storing the finished per-(document,
+term) weight, which turns a query into a scatter-add over postings lists.
+
+The part that matters is the validation: same formula, and against the library —
+**top-10 identical on every query, max score difference 8.8e-05** (float32 vs
+float64), **147× faster**. `rank_bm25` stays in requirements.txt as the reference
+I check against.
+
+"I rewrote a library function" is a weak answer. "I rewrote it and proved it
+matches to five decimal places" is a different conversation.
+
+### "What did the tokenizer experiment show?"
+
+Three ways to split `github/issue_read`:
+
+| tokenizer | bm25 recall@10 |
+|---|---|
+| whitespace only — identifier stays whole | **0.2143** |
+| split on non-alphanumeric | 0.2024 |
+| emit both whole and parts | 0.1984 |
+
+Keeping identifiers whole is best, by 1.2–1.6 points — directionally what I'd
+predict, though inside the noise band so I won't oversell it. Splitting produces
+common tokens (`issue`, `read`, `vs`) that dilute the signal; emitting both does
+that *and* inflates vocabulary 61%.
+
+After fusion the tokenizer stops mattering at all, because dense dominates the
+merged ranking regardless.
+
+### The number I'd actually lead with
+
+**57.9% of queries have the correct answer in neither retriever's top 50.**
+
+That reframes the whole project. A cross-encoder reranker reorders candidates —
+it cannot invent one — so stage 5's recall@10 is capped at 0.4206 no matter how
+good the reranker is. The lever for that 57.9% is better first-stage retrieval,
+which means the stage 5b fine-tune, not reranking.
+
+Concretely: **stage 5 should be judged on MRR and recall@1, not recall@10.**
+Knowing which metric a stage can even move, before building it, is the kind of
+thing the ablation table exists to tell you.
+
 
 ---
 

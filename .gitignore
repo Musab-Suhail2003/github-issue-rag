@@ -16,3 +16,6 @@ artifacts/
 # stage 3: Colab round-trip inputs/outputs, regenerable
 colab/
 shards/
+
+# run logs
+logs/

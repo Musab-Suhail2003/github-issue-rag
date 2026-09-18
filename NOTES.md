@@ -476,3 +476,124 @@ match is not available.
 **Prediction: stage 4 helps on this cluster, but less than the "BM25 catches
 identifiers" story suggests.** Recorded now, before running it, so the result can
 falsify it rather than be narrated after the fact.
+
+---
+
+## Stage 4 — BM25 + RRF hybrid (2026-09-19)
+
+**Config:** RRF k=60 (user-written `src/fusion.py`), each retriever contributes
+its top 50 before fusion, scored on the same 504-pair test split. BM25 indexes
+the same 2,000-char text the dense side embeds, so the comparison isolates the
+method rather than how much text each side got.
+
+### The number
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR | p50 |
+|---|---|---|---|---|---|
+| **dense only** | 0.1230 | 0.2123 | **0.2778** | 0.1627 | 35ms |
+| bm25 (atomic) | 0.1111 | 0.1964 | 0.2143 | 0.1423 | 79ms |
+| bm25 (words) | 0.1071 | 0.1746 | 0.2024 | 0.1351 | 120ms |
+| bm25 (both) | 0.1091 | 0.1706 | 0.1984 | 0.1344 | 153ms |
+| hybrid (atomic) | 0.1290 | 0.2222 | 0.2540 | 0.1664 | 147ms |
+| hybrid (words) | 0.1250 | 0.2202 | 0.2560 | 0.1641 | 195ms |
+| hybrid (both) | 0.1290 | 0.2262 | 0.2560 | 0.1660 | 218ms |
+
+**Hybrid does not beat dense. It loses 2.2 points of recall@10** (0.2778 →
+0.2560) while gaining ~1.4 on recall@1 and recall@5. Every one of those gaps is
+inside the ±4-point band stage 2 established, so the honest statement is:
+**stage 4 produced no significant improvement in either direction.**
+
+Dense-only remains the retriever of record at recall@10 = 0.2778.
+
+### Why — the ceiling diagnostic
+
+Rather than tune RRF and hope, measured how much unique signal BM25 has at all.
+At depth 50 on the same 504 queries:
+
+| | n | share |
+|---|---|---|
+| found by both | 120 | 23.8% |
+| dense only | 77 | 15.3% |
+| **BM25 only** | **15** | **3.0%** |
+| neither | 292 | 57.9% |
+
+```
+dense recall@50   0.3909
+bm25  recall@50   0.2679
+UNION recall@50   0.4206   <- hard ceiling for ANY fusion method
+```
+
+**BM25 finds 15 pairs dense misses.** A *perfect* fusion — one that always
+promoted the right answer — could gain 3.0 points at depth 50, and much less by
+depth 10. Meanwhile merging a weaker list costs dense's own correct answers
+their positions. The measured −2.2 is that trade, and it is not a tuning
+failure: the ceiling is structural.
+
+This is why the diagnostic was worth running before touching k or depth. Tuning
+a knob whose maximum payoff is 3 points is not where the effort belongs.
+
+### Prediction check — I was directionally right and still too optimistic
+
+Stage 3 recorded, before running this: *"stage 4 helps on this cluster, but less
+than the 'BM25 catches identifiers' story suggests."*
+
+Half right. BM25 does behave exactly as theory says — its 15 unique saves are
+literal phrase matches:
+
+> #307563 `[Unhandled Error] potential listener LEAK detected, popula…`
+> → #304828 `[042/d9f] potential listener LEAK in chatTerminalToolProgr…`
+
+> #318389 `Agent picker doesn't persist selection on an existing sess…`
+> → #318388 `switches out of custom agent mode after request`
+
+But "helps less than expected" was still too generous. It does not help at
+recall@10 at all. **Recording the prediction beforehand is what makes this a
+result rather than a rationalisation.**
+
+### Tokenizer comparison
+
+Three tokenizations of `Unknown tool github/issue_read with v1.113.0`:
+
+| tokenizer | produces | bm25 recall@10 | vocab |
+|---|---|---|---|
+| `atomic` (whitespace only) | `github/issue_read`, `v1.113.0` | **0.2143** | 363k |
+| `words` (alphanumeric runs) | `github`,`issue`,`read`,`v1`,`113`,`0` | 0.2024 | 310k |
+| `both` (whole + parts) | both of the above | 0.1984 | 586k |
+
+`atomic` is best for BM25 alone, by 1.2–1.6 points — directionally supporting
+"keep identifiers whole", though inside the noise band. Splitting identifiers
+apart produces common tokens (`issue`, `read`, `vs`) that dilute the signal, and
+`both` is worst because it does that *and* inflates the vocabulary 61%.
+
+Once fused, the tokenizer stops mattering (0.2540 / 0.2560 / 0.2560) — dense
+dominates the merged ranking either way.
+
+### The finding that should shape stage 5
+
+**57.9% of queries have the canonical in neither retriever's top 50.**
+
+A cross-encoder reranker reorders candidates; it cannot invent one. That caps
+stage 5's achievable recall@10 at 0.4206 no matter how good the reranker is, and
+realistically well below it. **The lever for that 57.9% is better first-stage
+retrieval — the stage 5b fine-tune — not reranking.** Stage 5 should therefore
+be judged on MRR and recall@1 (reordering what was found) rather than on
+recall@10.
+
+### BM25 implementation note
+
+`rank_bm25` was too slow to use: `BM25Okapi.get_scores` recomputes the length
+normalisation across all 84,942 documents for every query token, and an issue
+query is ~290 tokens — **2.7s per query**, i.e. 22 min per eval and over 2 hours
+for the seven configurations here.
+
+Everything except the idf lookup depends only on the document, so `BM25Index`
+precomputes the per-(document, term) weight once into an inverted index and a
+query becomes a scatter-add over postings lists.
+
+Verified against the library rather than assumed: same Okapi formula
+(k1=1.5, b=0.75, epsilon=0.25), **top-10 identical on every test query, max
+score difference 8.8e-05** (float32 vs float64), **147× faster** (1346ms → 9.2ms
+on a 4k-doc corpus). `rank_bm25` stays in `requirements.txt` as the reference
+implementation the tests validate against.
+
+Build cost on the full corpus: 91–159s per tokenizer, ~2.7GB peak RSS.

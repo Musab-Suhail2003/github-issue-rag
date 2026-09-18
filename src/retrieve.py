@@ -8,6 +8,8 @@ The encoder is passed in rather than built here, so scoring never imports torch.
 
 from __future__ import annotations
 
+import math
+import re
 from datetime import datetime
 
 import numpy as np
@@ -158,6 +160,166 @@ class MariaDBVectorRetriever:
         return [c for c in candidates if c in allowed][:n]
 
 
+# ------------------------------------------------------------------ tokenizers
+
+# vscode issues are full of identifiers -- github/issue_read, v1.113.0,
+# src/vs/workbench/foo.ts. How we split them decides whether BM25 can match on
+# them at all, so all three are measured rather than argued about.
+
+_WORDS = re.compile(r"[a-z0-9]+")
+_CHUNKS = re.compile(r"\S+")
+_TRIM = "\"'`(),.:;!?[]{}<>*#|"
+
+
+def tok_atomic(text: str) -> list[str]:
+    """Split on whitespace only. Identifiers stay whole: `github/issue_read`."""
+    return [w for w in (c.strip(_TRIM) for c in _CHUNKS.findall(text.lower())) if w]
+
+
+def tok_words(text: str) -> list[str]:
+    """Split on every non-alphanumeric: `github`, `issue`, `read`."""
+    return _WORDS.findall(text.lower())
+
+
+def tok_both(text: str) -> list[str]:
+    """Emit the whole identifier and its parts, so either can match."""
+    out = []
+    for chunk in tok_atomic(text):
+        out.append(chunk)
+        parts = _WORDS.findall(chunk)
+        if len(parts) > 1:
+            out.extend(parts)
+    return out
+
+
+TOKENIZERS = {"atomic": tok_atomic, "words": tok_words, "both": tok_both}
+
+
+class BM25Index:
+    """Okapi BM25 over an inverted index with the document weights precomputed.
+
+    Same formula as rank_bm25's BM25Okapi (k1=1.5, b=0.75, epsilon=0.25), and
+    verified to match it to floating point. Written out because rank_bm25
+    recomputes the length-normalisation term for all 85k documents on every
+    query token, which costs ~2.7s for a 290-token issue. Everything except the
+    idf lookup depends only on the document, so it is precomputed once and a
+    query becomes a scatter-add over postings lists: ~10ms.
+    """
+
+    K1, B, EPSILON = 1.5, 0.75, 0.25
+
+    def __init__(self, docs: list[list[str]]):
+        n = len(docs)
+        doc_len = np.array([len(d) for d in docs], dtype=np.float32)
+        avgdl = float(doc_len.mean())
+
+        df: dict[str, int] = {}
+        tfs = []
+        for tokens in docs:
+            tf: dict[str, int] = {}
+            for tok in tokens:
+                tf[tok] = tf.get(tok, 0) + 1
+            tfs.append(tf)
+            for tok in tf:
+                df[tok] = df.get(tok, 0) + 1
+
+        # rank_bm25's idf can go negative for terms in most documents; it floors
+        # those at epsilon * mean_idf rather than letting them subtract.
+        idf = {w: math.log(n - f + 0.5) - math.log(f + 0.5) for w, f in df.items()}
+        floor = self.EPSILON * (sum(idf.values()) / len(idf))
+        for w, v in idf.items():
+            if v < 0:
+                idf[w] = floor
+
+        # denom[d] is the part of the score that depends only on the document.
+        denom = self.K1 * (1 - self.B + self.B * doc_len / avgdl)
+
+        buckets: dict[str, list] = {w: [[], []] for w in df}
+        for d, tf in enumerate(tfs):
+            for tok, f in tf.items():
+                w = idf[tok] * (f * (self.K1 + 1)) / (f + denom[d])
+                buckets[tok][0].append(d)
+                buckets[tok][1].append(w)
+        self.postings = {
+            w: (np.array(ids, dtype=np.int32), np.array(ws, dtype=np.float32))
+            for w, (ids, ws) in buckets.items()
+        }
+        self.n = n
+
+    def scores(self, query: list[str]) -> np.ndarray:
+        out = np.zeros(self.n, dtype=np.float32)
+        # Repeated query terms contribute repeatedly, exactly as rank_bm25 does,
+        # so count them instead of iterating duplicates.
+        counts: dict[str, int] = {}
+        for tok in query:
+            counts[tok] = counts.get(tok, 0) + 1
+        for tok, c in counts.items():
+            hit = self.postings.get(tok)
+            if hit is not None:
+                ids, ws = hit
+                out[ids] += ws * c
+        return out
+
+
+class BM25Retriever:
+    """Lexical search over the same text the dense side embeds.
+
+    Indexes the truncated text, not the full body, so the comparison isolates
+    the retrieval method rather than how much text each side was given.
+    """
+
+    def __init__(self, conn, tokenizer=tok_words, max_chars: int = MAX_CHARS):
+        numbers, dates, docs = [], [], []
+        with db.cursor(conn) as cur:
+            cur.execute("SELECT number, title, body, created_at FROM issues "
+                        "ORDER BY created_at, number")
+            while True:
+                rows = cur.fetchmany(5000)
+                if not rows:
+                    break
+                for number, title, body, created in rows:
+                    numbers.append(number)
+                    dates.append(np.datetime64(created))
+                    docs.append(tokenizer(db.issue_text(title, body, max_chars)))
+        self.tokenizer = tokenizer
+        self.numbers = np.array(numbers, dtype=np.int64)
+        self.dates = np.array(dates, dtype="datetime64[s]")
+        self.index = BM25Index(docs)
+
+    def __len__(self) -> int:
+        return len(self.numbers)
+
+    def __call__(self, query_text: str, before_date: datetime, n: int) -> list[int]:
+        cutoff = int(np.searchsorted(self.dates, np.datetime64(before_date), side="left"))
+        if cutoff == 0:
+            return []
+        scores = self.index.scores(self.tokenizer(query_text[:MAX_CHARS]))[:cutoff]
+        k = min(n, cutoff)
+        top = np.argpartition(-scores, k - 1)[:k]
+        top = top[np.argsort(-scores[top])]
+        # Drop zero-score docs: they share no query term and are not candidates.
+        return [int(self.numbers[i]) for i in top if scores[i] > 0]
+
+
+class HybridRetriever:
+    """Dense + BM25 merged with reciprocal rank fusion.
+
+    Each side returns `depth` candidates, not `n`. Fusing two top-10 lists would
+    throw away most of what either found before they get a chance to agree.
+    """
+
+    def __init__(self, dense, bm25, k: int = 60, depth: int = 50):
+        self.dense, self.bm25 = dense, bm25
+        self.k, self.depth = k, depth
+
+    def __call__(self, query_text: str, before_date: datetime, n: int) -> list[int]:
+        from src.fusion import reciprocal_rank_fusion  # noqa: PLC0415
+
+        lists = [self.dense(query_text, before_date, self.depth),
+                 self.bm25(query_text, before_date, self.depth)]
+        return [num for num, _ in reciprocal_rank_fusion(lists, k=self.k)[:n]]
+
+
 def explain_index_usage(conn, model_name: str = MODEL_KEY) -> str:
     """Check the index is really used and not silently skipped."""
     probe = np.zeros(DIM, dtype="<f4")
@@ -181,19 +343,20 @@ if __name__ == "__main__":
     pairs = load("test")
     conn = db.connect()
     try:
-        t0 = time.time()
         encoder = PrecomputedEncoder.for_issues(conn, [d for d, _ in pairs])
         dense = VectorRetriever(conn, encoder)
-        print(f"loaded {len(dense):,} vectors in {time.time() - t0:.1f}s "
-              f"({dense.matrix.nbytes / 1048576:.0f}MB)\n")
+        print(f"corpus: {len(dense):,} vectors\n")
+        print(format_result("dense only", evaluate(dense, pairs)))
 
-        print(format_result("dense brute-force", evaluate(dense, pairs)))
-
-        hnsw = MariaDBVectorRetriever(conn, encoder)
-        print(format_result("dense HNSW (MariaDB)", evaluate(hnsw, pairs)))
-
-        print("\nEXPLAIN on the bare indexed query:")
-        print(explain_index_usage(conn))
+        for name, tokenizer in TOKENIZERS.items():
+            t0 = time.time()
+            bm25 = BM25Retriever(conn, tokenizer)
+            build = time.time() - t0
+            print(f"\n[{name}] index built in {build:.0f}s, "
+                  f"vocab {len(bm25.index.postings):,}")
+            print(format_result(f"  bm25 ({name})", evaluate(bm25, pairs)))
+            hybrid = HybridRetriever(dense, bm25)
+            print(format_result(f"  hybrid ({name})", evaluate(hybrid, pairs)))
+            del bm25, hybrid
     finally:
         conn.close()
-    
