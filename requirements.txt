@@ -2,3 +2,8 @@
 # not up front -- the file doubles as a record of what each stage actually cost.
 requests==2.34.2
 python-dotenv==1.2.3
+
+# Stage 1 (schema + ingestion)
+# PyMySQL, not mysql-connector-python: the latter fails multi-row upserts with
+# ON DUPLICATE KEY UPDATE at ~600 bound params. See NOTES.md, stage 1.
+PyMySQL==1.2.3

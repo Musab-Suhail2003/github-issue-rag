@@ -110,6 +110,214 @@ pattern that assumed a bare `#`. Fixing it moved extraction 37.6% → 40.4%.
 
 ---
 
+## Stage 1 — decisions you must be able to defend
+
+### "Tell me about a bug you had to actually debug."
+
+Use this one. It's the best story in the project because the first two
+diagnoses were both wrong.
+
+**Symptom.** The ingestion ran fine for 150 issues, then died with a MariaDB
+1064 syntax error whose message contained a chunk of an issue body — meaning the
+body text had reached the server as *SQL*, not as a bound parameter.
+
+**Wrong diagnosis #1.** I knew `mysql-connector-python` rewrites `executemany`
+INSERTs into one multi-row statement using a regex to find the VALUES clause,
+and that `ON DUPLICATE KEY UPDATE title=VALUES(title)` gives that regex a second
+`VALUES(...)` to match. Plausible, documented, and wrong. I replaced
+`executemany` with a hand-built multi-row INSERT — and it failed identically.
+
+**Wrong diagnosis #2.** I assumed bad characters in the body. I tested bodies
+with `%`, `%s`, quotes, backslashes, real and escaped newlines. All inserted
+fine. Then I tested the offending row alone, with its predecessor, with its
+successor — all fine. The data was not the problem.
+
+**What actually found it.** Bisecting on batch size. One row worked, 25 worked,
+50 failed. The SQL template was 2,337 bytes with 600 bound parameters, so
+neither statement length nor `max_allowed_packet` explained it. I ran the same
+50-row upsert twelve times against `mysql-connector` (C extension *and* pure
+Python) and twelve times against PyMySQL, with byte-identical parameters:
+
+```
+mysql-connector 26.7.0   ok=0   fail=12
+PyMySQL 1.2.3            ok=12  fail=0
+```
+
+A driver bug in parameter mapping at high parameter counts. I switched to
+PyMySQL, which CLAUDE.md already sanctioned as an alternative.
+
+**The point to make when telling it:** two confident, reasonable hypotheses were
+both wrong, and what settled it was a controlled comparison — same data, same
+statement, one variable changed. Also worth saying out loud: a driver that
+interpolates a parameter into SQL instead of binding it is an injection shape.
+Here the input came from the GitHub API rather than a user, but I wouldn't leave
+that driver in a path that touches untrusted input.
+
+### "Why is the issue number your primary key instead of an auto-increment id?"
+
+Because it's already the identifier everything else speaks. `eval.py` and
+`fusion.py` both pass `list[int]` of issue numbers; a surrogate key would mean a
+join on every lookup to translate back. Issue numbers are stable and unique
+within a repo, which is exactly the contract a natural key needs.
+
+The honest caveat: this breaks the moment I ingest a second repository, because
+numbers are only unique *per repo*. At that point the key becomes
+`(repo_id, number)`. Scoping decision, not an oversight — and saying so
+unprompted is better than being caught by it.
+
+### "You store `comment_count` and `comments_fetched` separately. Why?"
+
+`comment_count` is the API's true total; `comments_fetched` is how many I
+actually stored. I take `comments(last: 20)` because the duplicate declaration is
+almost always the closing comment, so paginating full threads would multiply the
+request count for data I don't need yet.
+
+Keeping both columns means stage 7 can tell a complete thread from a truncated
+one, instead of building a Q&A layer on top of silently-missing context. **The
+alternative — storing only what I fetched — loses the information that anything
+is missing at all.**
+
+### "What happens if the ingestion dies halfway through?"
+
+It resumes. Two mechanisms:
+
+1. Every page commits its cursor to `fetch_state` in the same transaction as the
+   rows. A kill costs at most one page.
+2. Writes are `INSERT ... ON DUPLICATE KEY UPDATE`, not `INSERT IGNORE`. A
+   re-run *refreshes* rows rather than skipping them, which matters because an
+   issue's state, labels and comment count all change over time.
+
+`INSERT IGNORE` would have been the lazy choice and would have quietly frozen
+every row at whatever it looked like on first fetch.
+
+### "Subtle one: when do you record the refresh watermark?"
+
+**Before the crawl starts, not after.** A 50-minute crawl means 50 minutes of
+issues being updated while I'm partway through. If I stamped the watermark at the
+end, any issue updated after I'd already passed its page would fall into the gap
+between "already crawled" and "newer than the watermark" — invisible forever.
+
+Taking the start time means the next refresh re-reads a little overlap. Since
+writes are idempotent, redundant work is free and missed work is not. **When in
+doubt, overlap.**
+
+### "Why delete-then-insert for labels instead of just inserting?"
+
+Labels are genuinely *removed* during triage — `needs-more-info` comes off when
+the reporter replies. A pure insert would accumulate stale rows and quietly
+corrupt any metadata filter built on them in stage 6. The delete is scoped to the
+issues in the current batch, so it stays cheap.
+
+### "Why is `fetch_state` a key/value table?"
+
+It holds a handful of crawl bookkeeping values — a cursor, a completion flag, a
+last-fetch timestamp. Adding one more shouldn't require a migration. This is the
+one place where schemaless beats typed columns, and it's worth being able to say
+*why it's the exception* rather than the rule.
+
+### Small ones
+
+- **Naive UTC datetimes.** MariaDB `DATETIME` is timezone-less and the GitHub
+  API returns UTC throughout, so tzinfo is stripped on the way in. Mixing aware
+  and naive datetimes in Python raises on comparison — and the corpus date bound
+  is compared against on every row.
+- **Write order: issues, then labels and comments.** Both carry a foreign key to
+  `issues`, so the parent has to land first within the transaction.
+- **NUL bytes stripped from bodies.** They show up in pasted terminal output and
+  upset both the connector and downstream tokenisers.
+
+---
+
+## Architecture — decisions you must be able to defend
+
+### "Why doesn't your live demo talk to your database?"
+
+The project splits into a batch side and a serving side. Batch does everything
+expensive and stateful: fetch from the GitHub API, store in MariaDB, embed,
+fine-tune, evaluate, then export four files. Serving loads those four files into
+RAM and answers queries.
+
+The serving path touches **no database, no API, no secret**. That's deliberate:
+a Hugging Face Space restarts on its own schedule, and anything that could fail
+at startup is something that can fail *during an interview*. The demo depends on
+four files and nothing else.
+
+The honest cost: the corpus is a frozen snapshot. I surface the snapshot date
+and issue count in the UI so it reads as a deliberate choice rather than
+something I forgot to refresh.
+
+### "Why Streamlit instead of a React frontend and an API?"
+
+One Python process renders the UI server-side over a websocket — no API layer,
+no client build step, no CORS. A separate frontend would be real work that
+demonstrates nothing this project is about. The interesting engineering is in
+retrieval, and every hour spent on a client is an hour not spent on the ablation
+table.
+
+### "How do you refresh the snapshot without refetching all 85k issues?"
+
+`fetch.py --since`, keyed on **`updatedAt`, not `createdAt`.**
+
+This is the part worth saying out loud, because the naive version is wrong: an
+issue created in January 2024 can be closed as a duplicate in 2026. The
+duplicate marking — the exact thing my ground truth depends on — happens long
+after creation. A refresh keyed on creation date would never see it, and my test
+set would silently stop growing while looking like it worked.
+
+So the two modes order by different fields:
+
+| mode | order by | stop at |
+|---|---|---|
+| initial backfill | `CREATED_AT DESC` | `createdAt < 2024-01-01` |
+| `--since` refresh | `UPDATED_AT DESC` | `updatedAt < last_fetch` |
+
+`fetch_state` stores a cursor so an interrupted backfill resumes, and a
+completed-at timestamp so `--since` has a floor.
+
+### "Why MariaDB with a native VECTOR type instead of pgvector or a vector DB?"
+
+It was already installed, and MariaDB has had a native `VECTOR` column type with
+HNSW indexing since 11.7 — so no Docker, no extra service, no pgvector
+extension to manage.
+
+Be honest about the second half of this answer: at 84,877 × 384 float32 (~130MB)
+a brute-force cosine scan in numpy is both exact and fast enough. The vector
+index isn't strictly necessary at this scale. It's there because it's the path
+that *would* matter at 10× the corpus, and because approximate-vs-exact is worth
+being able to compare. Claiming I needed it would be overselling.
+
+One real gotcha: MariaDB only uses the vector index when the query is a bare
+`ORDER BY VEC_DISTANCE_COSINE(...) LIMIT n` **and** the index was built with
+`DISTANCE=cosine`. Any mismatch silently falls back to a full scan — no error,
+just slow. Verify with `EXPLAIN`.
+
+### "Why no LangChain or LlamaIndex?"
+
+Because the retrieval logic *is* the project. A framework would hide the exact
+things an interviewer wants to probe — how RRF merges two ranked lists, how the
+time filter is applied, why the embedding prefixes were left off. At this scale
+the wrapper saves maybe fifty lines and costs the ability to explain my own
+system.
+
+### "Why does the hosted demo use a weaker reranker than your eval?"
+
+`bge-reranker-v2-m3` is ~568M parameters and too slow on a free Space's 2 vCPU,
+so serving uses `bge-reranker-base` or `ms-marco-MiniLM-L-6-v2` instead.
+
+The answer that matters is that **I measured both**. Shipping the smaller model
+silently would be a shortcut; recording what it costs in recall points makes it
+an engineering decision with a stated price.
+
+### Small ones
+
+- **Dedicated DB user, not root.** Least privilege — a bug in ingestion can't
+  reach another schema. Costs one minute.
+- **Idempotent upserts.** `INSERT ... ON DUPLICATE KEY UPDATE` means an 850-request
+  ingestion that dies at request 600 resumes instead of restarting, and a
+  re-run refreshes rather than duplicating.
+
+---
+
 ## Concepts to be solid on
 
 **Time-aware evaluation / leakage.** The eval only searches issues created
@@ -131,6 +339,14 @@ resumes instead of restarting.
 **Cursor vs. offset pagination.** GraphQL hands you an opaque cursor for the next
 page. Unlike `OFFSET`, it stays correct when rows are inserted mid-crawl, and it
 doesn't get slower as you go deeper.
+
+**Bi-encoder vs. cross-encoder.** A bi-encoder embeds the query and each
+document separately, so document vectors can be precomputed — that's what makes
+retrieval over 85k issues fast. A cross-encoder reads the query and one document
+*together* and scores the pair, which is far more accurate and far too slow to
+run over the whole corpus. Hence the two-stage shape: bi-encoder retrieves ~50
+candidates, cross-encoder reorders them. Know why you can't just use the
+cross-encoder for everything.
 
 **Python packaging** (you asked about this — worth knowing cold):
 - A **virtualenv is not a Python installation.** It's a folder with a symlink to
