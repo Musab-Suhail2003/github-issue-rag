@@ -19,3 +19,7 @@ shards/
 
 # run logs
 logs/
+
+# local-only working docs
+CLAUDE.md
+INTERVIEW.md
