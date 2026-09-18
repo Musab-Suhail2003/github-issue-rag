@@ -131,14 +131,48 @@ def replace_labels(conn, issue_numbers: Iterable[int], rows: Sequence[tuple]) ->
 
 # ---------------------------------------------------------------- text
 
-def issue_text(title: str | None, body: str | None, max_chars: int = 8000) -> str:
+# vscode's bug template appends a System Info dump, an A/B experiments list and
+# version strings to every report. Measured over a 4k sample, that is ~47% of the
+# first 2,000 characters -- the window bge-small actually reads. Stripping it is
+# stage 6 work pulled forward, because a fine-tune on this text would learn to
+# read GPU driver strings.
+_DETAILS = re.compile(r"<details>.*?</details>", re.S | re.I)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_TEMPLATE_TYPE = re.compile(r"^\s*Type:\s*<b>.*?</b>\s*$", re.I | re.M)
+_ENV_LINE = re.compile(
+    r"^\s*(?:VS Code version|Extension version|OS version|Modes|Remote OS version"
+    r"|Local OS version|Extension Host Version|Steps to Reproduce)\s*:.*$",
+    re.I | re.M,
+)
+_BLANKS = re.compile(r"\n{3,}")
+
+
+def strip_boilerplate(body: str | None) -> str:
+    """Remove the parts of a vscode issue body that are identical everywhere.
+
+    Drops <details> blocks (System Info, A/B Experiments), HTML comments from the
+    issue template, and the version/OS header lines. Leaves prose and code alone.
+    """
+    if not body:
+        return ""
+    text = _DETAILS.sub(" ", body)
+    text = _HTML_COMMENT.sub(" ", text)
+    text = _TEMPLATE_TYPE.sub("", text)
+    text = _ENV_LINE.sub("", text)
+    return _BLANKS.sub("\n\n", text).strip()
+
+
+def issue_text(title: str | None, body: str | None, max_chars: int = 8000,
+               clean: bool = False) -> str:
     """Turn an issue into the one text string everything else uses.
 
     Shared by eval.py and embed.py so the query side and document side can never
-    compose text differently.
+    compose text differently. clean=False by default so the stage 3 and 4 numbers
+    stay reproducible; stage 6 onward passes clean=True.
     """
+    body = strip_boilerplate(body) if clean else (body or "")
     parts = [(title or "").strip()]
-    if body:
+    if body.strip():
         parts.append(body.strip())
     return "\n\n".join(p for p in parts if p)[:max_chars]
 

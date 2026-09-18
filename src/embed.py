@@ -27,6 +27,9 @@ import numpy as np
 # MODEL_KEY goes in the DB and must be ASCII, <= 48 chars (see schema.sql).
 MODEL_ID = "BAAI/bge-small-en-v1.5"
 MODEL_KEY = "bge-small-en-v1.5"
+# Same model, boilerplate stripped from the text. Stored under its own key so
+# the stage 3 vectors survive for a like-for-like comparison.
+MODEL_KEY_CLEAN = "bge-small-en-v1.5-clean"
 DIM = 384
 
 # bge-small reads 512 tokens (~2k chars). Anything longer is discarded by the
@@ -36,7 +39,8 @@ MAX_CHARS = 2000
 SHARD_SIZE = 10_000
 
 
-def export_texts(conn, path: Path, limit: int | None = None) -> int:
+def export_texts(conn, path: Path, limit: int | None = None,
+                 model_key: str = MODEL_KEY, clean: bool = False) -> int:
     """Write {"n": issue_number, "t": text} JSONL.gz for issues lacking a vector."""
     from src import db  # noqa: PLC0415
 
@@ -52,14 +56,14 @@ def export_texts(conn, path: Path, limit: int | None = None) -> int:
         sql += f" LIMIT {int(limit)}"
     written = 0
     with db.cursor(conn) as cur:
-        cur.execute(sql, (MODEL_KEY,))
+        cur.execute(sql, (model_key,))
         with gzip.open(path, "wt", encoding="utf-8") as fh:
             while True:
                 rows = cur.fetchmany(5000)
                 if not rows:
                     break
                 for number, title, body in rows:
-                    text = db.issue_text(title, body, max_chars=MAX_CHARS)
+                    text = db.issue_text(title, body, max_chars=MAX_CHARS, clean=clean)
                     if not text.strip():
                         # A few issues are a single invisible character with no
                         # body. A vector for whitespace is meaningless.
@@ -106,7 +110,8 @@ def encode(texts_path: Path, out_dir: Path, batch_size: int = 64) -> None:
         print(f"  shard {shard_no}: {len(chunk):,} vectors", file=sys.stderr)
 
 
-def import_vectors(conn, out_dir: Path, chunk: int = 500) -> int:
+def import_vectors(conn, out_dir: Path, chunk: int = 500,
+                   model_key: str = MODEL_KEY) -> int:
     """Load shards into MariaDB.
 
     Sends raw little-endian float32 bytes, which is MariaDB's VECTOR wire
@@ -126,7 +131,7 @@ def import_vectors(conn, out_dir: Path, chunk: int = 500) -> int:
             raise SystemExit(f"{ids_path.name}: {len(ids)} ids vs {len(vecs)} vectors")
         if vecs.shape[1] != DIM:
             raise SystemExit(f"{emb_path.name}: dim {vecs.shape[1]}, expected {DIM}")
-        rows = [(int(n), MODEL_KEY, v.tobytes()) for n, v in zip(ids, vecs)]
+        rows = [(int(n), model_key, v.tobytes()) for n, v in zip(ids, vecs)]
         with db.cursor(conn) as cur:
             for i in range(0, len(rows), chunk):
                 block = rows[i:i + chunk]
@@ -150,6 +155,8 @@ def main() -> None:
     ap.add_argument("-o", "--out", default="shards", help="shard dir for --encode")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--limit", type=int, help="export only N issues (smoke test)")
+    ap.add_argument("--clean", action="store_true",
+                    help="strip template boilerplate; uses the -clean model key")
     args = ap.parse_args()
 
     if args.encode:
@@ -160,14 +167,15 @@ def main() -> None:
 
     conn = db.connect()
     try:
+        key = MODEL_KEY_CLEAN if args.clean else MODEL_KEY
         if args.export_texts:
-            n = export_texts(conn, Path(args.export_texts), args.limit)
+            n = export_texts(conn, Path(args.export_texts), args.limit, key, args.clean)
             size = Path(args.export_texts).stat().st_size / 1048576
             print(f"exported {n:,} texts -> {args.export_texts} ({size:.1f} MB gzipped)")
         elif args.import_vectors:
-            n = import_vectors(conn, Path(args.import_vectors))
+            n = import_vectors(conn, Path(args.import_vectors), model_key=key)
             with db.cursor(conn) as cur:
-                cur.execute("SELECT COUNT(*) FROM embeddings WHERE model_name=%s", (MODEL_KEY,))
+                cur.execute("SELECT COUNT(*) FROM embeddings WHERE model_name=%s", (key,))
                 have = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM issues")
                 want = cur.fetchone()[0]
