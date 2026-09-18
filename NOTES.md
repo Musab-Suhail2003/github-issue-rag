@@ -360,3 +360,119 @@ valid at the same depth.
 `db.issue_text(title, body)` lives in the data layer so eval and stage 3's
 `embed.py` cannot drift apart. If the query side and document side composed text
 differently, the numbers would be measuring that discrepancy as much as the model.
+
+---
+
+## Stage 3 — Dense baseline (2026-09-19)
+
+**Config:** `BAAI/bge-small-en-v1.5`, 384 dims, L2-normalised, **no** `query:`/
+`passage:` prefix (retrieval is symmetric — both sides are issue text). Text is
+`title + "\n\n" + body` truncated to 2,000 chars, which is past the model's
+512-token window. Encoded on a Colab T4 in ~2 min; scored on the 504-pair test
+split.
+
+### The number
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR | p50 latency |
+|---|---|---|---|---|---|
+| **dense brute-force (numpy)** | **0.1230** | **0.2123** | **0.2778** | **0.1627** | 32.1 ms |
+| dense HNSW (MariaDB index) | 0.1250 | 0.2004 | 0.2679 | 0.1604 | 85.7 ms |
+| *random floor (stage 2)* | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.1 ms |
+
+**Brute-force numpy is the baseline of record: recall@10 = 0.2778.** The correct
+duplicate reaches the top 10 for roughly one query in four, and the top 1 for one
+in eight. As predicted, that is bad — and it is the number every later stage is
+measured against.
+
+### Brute-force vs HNSW
+
+The two are **statistically indistinguishable on accuracy**: the largest gap
+(recall@10, 0.2778 vs 0.2679) is 1.0 point, well inside the ±4-point significance
+band recorded in stage 2. Do not read the HNSW recall@1 edge as a win; it is two
+pairs.
+
+The real difference is latency, and it runs *against* the index: 32ms vs 86ms.
+Three reasons, all specific to this scale:
+
+1. Brute force is one 84,942 × 384 matmul in-process — ~124MB, trivially cached.
+2. The HNSW path costs two SQL round trips per query (vector search, then the
+   date filter) plus protocol overhead.
+3. It over-fetches 10× candidates to survive post-filtering, so it does more
+   index work than the 10 results need.
+
+**The index is not justified at this corpus size, and the README should say so
+plainly.** It earns its place when the matrix stops fitting in RAM. Keeping both
+paths is what makes that a measured claim rather than an assumption.
+
+`EXPLAIN` confirms the index is genuinely used on the bare query, not silently
+skipped:
+
+```
+(1, 'SIMPLE', 'embeddings', 'index', None, 'vec', '1538', None, '10', '')
+                             ^^^^^^^        ^^^^^
+```
+
+### Time filtering defeats the vector index — the structural finding
+
+MariaDB uses a `VECTOR INDEX` only for a bare
+`ORDER BY VEC_DISTANCE_COSINE(...) LIMIT n`. Adding `WHERE created_at < ?`
+disqualifies it, with no error and no warning — just a silent full scan.
+
+Since this eval is time-aware by construction, **every** query needs that filter.
+The workaround (`MariaDBVectorRetriever`) over-fetches `n × 10` neighbours from
+the bare indexed query and filters by date afterwards, which is approximate a
+second time: if enough near neighbours postdate the query, fewer than `n`
+survive. Brute-force numpy has no such problem — vectors are held in `created_at`
+order, so the time filter is an array slice.
+
+### Ingest cost
+
+Importing 84,942 vectors took **10m38s**, of which only 4.7s was Python CPU. The
+rest is MariaDB building the HNSW graph incrementally, one insert at a time. Table
+is 226MB: ~124MB of vectors plus ~100MB of index. Worth knowing before stage 5b,
+which requires a second full encode and import.
+
+### Examples
+
+**What it gets right — near-identical text.** All rank-1 hits look like this:
+
+| query | canonical | rank |
+|---|---|---|
+| #304776 "Never ending generation." | #304775 "Never ending generation." | 1 |
+| #304812 "remove the code usggestion until i say to show" | #304811 *(identical title)* | 1 |
+| #304858 "High CPU usage when multiple extensions register many chatAgent…" | #304857 *(identical)* | 1 |
+
+These are duplicates filed minutes apart with the same title, including the same
+typo. Embeddings are not doing much work here — string equality would find them.
+
+**What it misses — same bug, different vocabulary.** Three separate issues all
+point at canonical #302880 and none retrieved it in the top 10:
+
+| query | canonical |
+|---|---|
+| #305022 "Custom agent front matter reports unknown tool for github/issue_read" | #302880 "Problems panel showing problems from Copilot configuration files" |
+| #305137 `Unknown tool "problems" with v1.113.0` | #302880 |
+| #305190 `Unknown tool 'github/issue_read' warning in Copilot Chat` | #302880 |
+
+The reporter describes a symptom (*"unknown tool"*); the maintainer titled the
+canonical after the cause (*"Problems panel…"*). No shared title vocabulary, and
+bge-small does not bridge it.
+
+### Stage 4 prediction — qualified, because the evidence is mixed
+
+Checked the bodies directly rather than assuming:
+
+| token | in query #305190 | in canonical #302880 |
+|---|---|---|
+| `unknown tool` | ✅ | ✅ |
+| `issue_read` | ✅ | ❌ |
+| `problems` | ❌ | ✅ |
+
+So BM25 **does** have a real hook — `unknown tool` appears in both bodies, a
+lexical bridge the embedding failed to exploit. But the *most distinctive* token,
+`issue_read`, is absent from the canonical entirely, so the obvious rare-term
+match is not available.
+
+**Prediction: stage 4 helps on this cluster, but less than the "BM25 catches
+identifiers" story suggests.** Recorded now, before running it, so the result can
+falsify it rather than be narrated after the fact.

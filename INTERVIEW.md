@@ -33,7 +33,8 @@ The ablation table is the deliverable.
 | embedding size | 384 dims × 84,877 ≈ 130MB float32 |
 | median issue body | 1,773 chars (p90 4,472) |
 | comments ingested | 208,753 (avg 2.56/issue) |
-| database on disk | ~400MB |
+| database on disk | ~400MB (+226MB embeddings) |
+| **dense baseline** | **recall@10 0.2778, MRR 0.1627** |
 
 ---
 
@@ -285,6 +286,102 @@ one place where schemaless beats typed columns, and it's worth being able to say
   `issues`, so the parent has to land first within the transaction.
 - **NUL bytes stripped from bodies.** They show up in pasted terminal output and
   upset both the connector and downstream tokenisers.
+
+---
+
+## Stage 3 — decisions you must be able to defend
+
+### "Your baseline gets 27.8% recall@10. Isn't that terrible?"
+
+Yes, and that's the point of recording it. A dense-only baseline on real
+duplicate detection is *supposed* to be weak — if it were 90% there'd be nothing
+to build and no ablation table worth showing.
+
+What matters is that it's **honestly measured against a floor**: random retrieval
+scores 0.0000, so 27.8% is real signal, not an artefact. Every later stage gets
+compared against this exact number on this exact test split.
+
+### "Why did the vector index make things slower?"
+
+Because at 85k vectors it isn't needed, and I'd rather say that than pretend
+otherwise.
+
+Brute-force cosine in numpy is 32ms; the MariaDB HNSW path is 86ms. Three
+reasons: brute force is a single in-process matmul over a 124MB matrix; the HNSW
+path costs two SQL round trips per query plus protocol overhead; and it
+over-fetches 10× candidates to survive post-filtering.
+
+Accuracy is a wash — the biggest gap is 1.0 point, inside my own ±4-point
+significance band, so I won't claim either is more accurate.
+
+The index earns its place when the matrix stops fitting in RAM. Keeping both
+paths is what lets me say that as a measurement instead of an assumption.
+
+### The best technical finding in this stage: time filtering defeats the index
+
+MariaDB uses a `VECTOR INDEX` only for a bare
+`ORDER BY VEC_DISTANCE_COSINE(...) LIMIT n`. Add `WHERE created_at < ?` and the
+index is silently disqualified — no error, no warning, just a full scan.
+
+My eval is time-aware by construction, so **every single query needs that
+filter**. The workaround over-fetches 10× neighbours from the bare indexed query
+and date-filters afterwards, which is approximate a second time: if enough near
+neighbours postdate the query, fewer than n survive.
+
+Brute force sidesteps it entirely — vectors are held in `created_at` order, so
+the time filter is an array slice rather than a predicate.
+
+This is a good answer to "what surprised you," and it generalises: **ANN indexes
+and metadata filters fight each other.** It's the same reason pgvector and
+dedicated vector DBs have all had to build pre- vs post-filtering strategies.
+
+### "Why no query prefix? bge's model card recommends one."
+
+Because that instruction is for **asymmetric** retrieval — a short query against
+long passages. Here both sides are issue text of similar length and register, so
+it's symmetric, and applying the prefix to one side would put query and document
+vectors in different regions of the space.
+
+The eval and the embedder share `db.issue_text()` for exactly this reason: if the
+two sides composed text differently, the numbers would partly be measuring that
+discrepancy instead of the model.
+
+### "Show me a case it fails on."
+
+Three separate issues all point at canonical #302880 and none of them retrieved
+it in the top 10:
+
+- #305190 `Unknown tool 'github/issue_read' warning in Copilot Chat`
+- #305137 `Unknown tool "problems" with v1.113.0`
+- → #302880 "Problems panel showing problems from Copilot configuration files"
+
+The reporters describe a **symptom**; the maintainer titled the canonical after
+the **cause**. No shared title vocabulary, and a 33M-parameter embedding model
+doesn't bridge that gap.
+
+Meanwhile every rank-1 hit is a near-identical title — #304776 "Never ending
+generation." → #304775 "Never ending generation.", filed minutes apart with the
+same typo. **The model is winning where string equality would win anyway, and
+losing everywhere that needs actual understanding.** That is the honest read of a
+27.8% baseline.
+
+### A prediction I wrote down before testing it
+
+Rather than assume "BM25 catches identifiers," I checked the bodies:
+
+| token | query #305190 | canonical #302880 |
+|---|---|---|
+| `unknown tool` | ✅ | ✅ |
+| `issue_read` | ✅ | ❌ |
+
+So BM25 has a genuine hook (`unknown tool` is in both) but *not* the rare
+identifier the usual story relies on — `issue_read` isn't in the canonical at
+all. Prediction recorded in NOTES.md before running stage 4: **it helps, but less
+than the standard narrative suggests.**
+
+Being willing to write a falsifiable prediction down first is worth more in an
+interview than any individual number.
+
 
 ---
 

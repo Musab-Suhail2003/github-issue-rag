@@ -12,3 +12,7 @@ probe_out/
 
 # generated serving artifacts (stage 8) - pushed to the Space, not here
 artifacts/
+
+# stage 3: Colab round-trip inputs/outputs, regenerable
+colab/
+shards/

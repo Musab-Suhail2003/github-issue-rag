@@ -190,3 +190,29 @@ def explain_index_usage(conn, model_name: str = MODEL_KEY) -> str:
         )
         rows = cur.fetchall()
     return "\n".join(str(r) for r in rows)
+
+
+if __name__ == "__main__":
+    import time
+
+    from src.eval import evaluate, format_result
+    from src.testset import load
+
+    pairs = load("test")
+    conn = db.connect()
+    try:
+        t0 = time.time()
+        encoder = PrecomputedEncoder.for_issues(conn, [d for d, _ in pairs])
+        dense = VectorRetriever(conn, encoder)
+        print(f"loaded {len(dense):,} vectors in {time.time() - t0:.1f}s "
+              f"({dense.matrix.nbytes / 1048576:.0f}MB)\n")
+
+        print(format_result("dense brute-force", evaluate(dense, pairs)))
+
+        hnsw = MariaDBVectorRetriever(conn, encoder)
+        print(format_result("dense HNSW (MariaDB)", evaluate(hnsw, pairs)))
+
+        print("\nEXPLAIN on the bare indexed query:")
+        print(explain_index_usage(conn))
+    finally:
+        conn.close()
