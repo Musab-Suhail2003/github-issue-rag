@@ -162,9 +162,9 @@ The project splits into a **batch side** and a **serving side**. This split is a
 hard constraint, not a stage-8 concern — code written from stage 3 onward must
 respect it.
 
-**Batch (offline, my machine or a GitHub Actions runner):** fetch from the GitHub
-API → MariaDB → embed → fine-tune → evaluate → `scripts/export.py` writes
-`artifacts/` → git push to the Hugging Face Space.
+**Batch (offline):** fetch from the GitHub API → MariaDB → embed → fine-tune →
+evaluate → `scripts/export.py` writes `artifacts/` → git push to the Hugging
+Face Space.
 
 **Serving (Hugging Face Space, always on):** Streamlit process loads `artifacts/`
 into RAM at startup, embeds the visitor's query, retrieves, reranks, renders.
@@ -177,6 +177,41 @@ visitor's browser  <--websocket-->  Hugging Face Space
 GitHub API --> batch pipeline --> artifacts/ --> git push --> Space
                (local or CI)
 ```
+
+### Where each job runs
+
+Decided 2026-09-18. This laptop is an i7-8650U with no GPU, so the two
+GPU-shaped jobs move off it; everything else stays local because local is the
+fastest place to iterate.
+
+| job | runs on | why |
+|---|---|---|
+| bulk embedding (85k issues) | **Google Colab** (free T4) | GPU, one-off, no cost |
+| contrastive fine-tune (stage 5b) | **Google Colab** | GPU, one-off, no cost |
+| fetch, eval, retrieval dev, stages 3–7 | **this laptop** | MariaDB is here; no CI loop to fight |
+| incremental refresh | **GitHub Actions** *(only if built)* | stage 8+, optional |
+| serving the Streamlit demo | **Hugging Face Space** | free, always-on, no secrets |
+
+Consequences for code written from stage 3 on:
+
+- `embed.py` must be **headless and checkpointed by issue number**, so the same
+  script runs unchanged on a laptop or a Colab runtime, and a disconnect costs
+  only the current batch. Colab free runtimes are reclaimed without warning.
+- Retrieval and eval must not require `torch`. The encoder is **injected** into
+  the retriever: the Space passes a live sentence-transformers model, the eval
+  passes precomputed vectors. Only numpy is needed to score.
+- The embeddings table keys on **(issue_number, model_name)** so vectors from the
+  base model and the stage 5b fine-tune coexist. The ablation table needs both
+  rows, and a fine-tune that turns out worse must be revertible without
+  re-encoding. Note a 768-dim model would need a separate table rather than a
+  `VECTOR(384)` column.
+- Embeddings are deterministic, so an issue is encoded **once per model**, not
+  once per refresh. A full re-encode is required only when the model changes.
+
+If refresh is ever automated: do **not** cache the MariaDB datadir — Actions
+evicts caches untouched for 7 days, which misses on any monthly cadence. Hydrate
+a service container from the exported `artifacts/` instead; they are already a
+portable snapshot.
 
 Rules this implies:
 
