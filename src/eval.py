@@ -4,19 +4,11 @@
     from src.testset import load
     evaluate(my_retriever, load("test"))
 
-The retriever contract, fixed by CLAUDE.md:
+    python -m src.eval    # sanity-check the harness itself
 
-    retriever(query_text: str, before_date: datetime, n: int) -> list[int]
-
-returning issue numbers ranked best-first. `before_date` is not optional and not
-advisory: a retriever that ignores it will score well here and be worthless in
-production, because it is answering with issues that did not exist when the
-question was asked. That is look-ahead bias, the RAG equivalent of training on
-the future.
-
-Run directly to sanity-check the harness against two synthetic retrievers:
-
-    python -m src.eval
+A retriever takes (query_text, before_date, n) and returns issue numbers, best
+first. Ignoring before_date means answering with issues that did not exist yet --
+it scores well here and is useless in production.
 """
 
 from __future__ import annotations
@@ -33,7 +25,7 @@ Retriever = Callable[[str, datetime, int], list[int]]
 
 
 def _query_rows(conn, numbers: list[int]) -> dict[int, tuple[str, datetime]]:
-    """One query, not N. Returns {issue_number: (text, created_at)}."""
+    """Fetch every query issue in one round trip, not one per pair."""
     if not numbers:
         return {}
     placeholders = ",".join(["%s"] * len(numbers))
@@ -54,17 +46,11 @@ def evaluate(
 ) -> dict:
     """Score a retriever against labelled (duplicate, canonical) pairs.
 
-    Returns {'recall@1': .., 'recall@5': .., 'recall@10': .., 'mrr': ..} plus
-    'n', 'skipped' and latency percentiles.
+    Returns recall@k for each k, plus mrr, n, skipped and latency percentiles.
 
-    recall@k here is per-query hit rate: each query has exactly one correct
-    answer, so "recall@k" and "hit rate@k" coincide. Worth knowing, because with
-    one relevant document per query, recall@1 is also precision@1 and a reviewer
-    may ask.
-
-    MRR is truncated at max(ks): a canonical ranked below the retrieved window
-    contributes 0 rather than an unknown 1/rank. That makes it MRR@max(ks), and
-    comparisons across stages are only valid at the same max(ks).
+    Each query has exactly one right answer, so recall@k is a hit rate (and
+    recall@1 is also precision@1). MRR is truncated at max(ks): anything ranked
+    below the window scores 0, so only compare MRR at the same depth.
     """
     conn = db.connect()
     try:
@@ -81,7 +67,7 @@ def evaluate(
     for i, (dup, canonical) in enumerate(test_pairs):
         row = rows.get(dup)
         if row is None:
-            skipped += 1  # duplicate not in the issues table; nothing to query with
+            skipped += 1  # no such issue to build a query from
             continue
         query_text, created_at = row
 
@@ -89,9 +75,8 @@ def evaluate(
         ranked = retriever(query_text, created_at, depth)
         latencies.append((time.perf_counter() - t0) * 1000)
 
-        # Defensive: the query issue itself is never a valid answer. A retriever
-        # honouring before_date will already exclude it, but a bug here would
-        # otherwise look like a good score.
+        # The query issue is never a valid answer. A time-filter bug should
+        # look like a bad score, not a suspiciously good one.
         ranked = [r for r in ranked if r != dup][:depth]
 
         scored += 1
@@ -128,10 +113,10 @@ def format_result(name: str, result: dict) -> str:
 # --------------------------------------------------------------- self-check
 
 def _oracle(pairs: list[tuple[int, int]]) -> Retriever:
-    """Returns the right answer first. Must score exactly 1.0 on every metric.
+    """Always returns the right answer first, so it must score exactly 1.0.
 
-    This is not a baseline, it is a unit test of the metric: if recall@1 is not
-    1.0 here, the harness is broken and every number produced later is noise.
+    A unit test of the metric, not a baseline. If this is not 1.0 the harness is
+    broken and every later number is noise.
     """
     answer = dict(pairs)
     lookup = {}
@@ -150,11 +135,10 @@ def _oracle(pairs: list[tuple[int, int]]) -> Retriever:
 
 
 def _random_retriever(seed: int = 0) -> Retriever:
-    """Draws from issues predating the query. Establishes the floor.
+    """Picks at random from issues predating the query, to establish the floor.
 
-    The floor is not zero -- it is roughly n/|corpus before the query| -- and
-    knowing that number is what makes stage 3's result meaningful rather than
-    just 'better than nothing'.
+    Makes a real retriever's score meaningful instead of just "better than
+    nothing".
     """
     conn = db.connect()
     with db.cursor(conn) as cur:

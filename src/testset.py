@@ -1,13 +1,11 @@
 """Stage 2a: extract the labelled (duplicate -> canonical) test set.
 
-Deliberately separate from eval.py. Extraction is regex over 208k comments and
-produces a *frozen artifact* (testset.json, committed); evaluation reads that
-artifact and runs many times. If extraction ran inside every eval, a tweak to
-the regex battery would silently move the benchmark, and the stage-to-stage
-numbers in NOTES.md would stop being comparable. Freezing it is the whole point.
-
     python -m src.testset            # rebuild testset.json
     python -m src.testset --stats    # report only, write nothing
+
+Kept separate from eval.py so the test set is a frozen file. If extraction ran
+inside every eval, changing a regex would silently move the benchmark and the
+numbers in NOTES.md would stop being comparable.
 """
 
 from __future__ import annotations
@@ -22,9 +20,8 @@ from src import db
 
 OUT = Path(__file__).resolve().parent.parent / "testset.json"
 
-# Measured in stage 0, validated against the full corpus in stage 1 (46.4%
-# extraction). See NOTES.md for why bare "#123" references are excluded: roughly
-# half are false, and a noisy label caps the measurable ceiling invisibly.
+# Bare "#123" references are excluded on purpose -- about half are false, and a
+# noisy label would cap the measurable ceiling invisibly. See NOTES.md.
 REF = r"\[?(?:#|https://github\.com/microsoft/vscode/issues/)(\d+)"
 PATTERNS = [
     ("dup_of",     re.compile(r"\b(?:duplicate|dup)\s+of\s+" + REF, re.I)),
@@ -59,10 +56,9 @@ def comments_by_issue(conn) -> dict[int, list[str]]:
 
 
 def extract(issue_number: int, bodies: list[str]) -> tuple[int, str] | None:
-    """First pattern to match wins, scanning comments newest-first.
+    """First matching pattern wins, scanning comments newest-first.
 
-    Newest-first because a thread can speculate early and conclude late; the
-    closing comment is the maintainer's actual verdict.
+    Newest-first because threads speculate early and conclude late.
     """
     for name, rx in PATTERNS:
         for body in reversed(bodies):
@@ -94,17 +90,13 @@ def build(conn) -> dict:
         pattern_hits[pattern] += 1
 
         if target not in created:
-            # Either created before the corpus bound, or a PR, or deleted.
-            # CLAUDE.md requires dropping these rather than guessing.
+            # Filed before the corpus bound, or a PR, or deleted. Drop it.
             counts["canonical_not_in_corpus"] += 1
             continue
 
-        # The eval is time-aware: it only searches issues created BEFORE the
-        # query. If the canonical was filed after the duplicate, no time-aware
-        # retriever could ever return it, and scoring against it would depress
-        # every stage's recall for a reason that has nothing to do with
-        # retrieval quality. Maintainers do sometimes close the older issue as a
-        # duplicate of the newer one, so this is real, not hypothetical.
+        # Maintainers sometimes close the OLDER issue as a duplicate of the
+        # newer one. A time-aware retriever can never return those, so keeping
+        # them would depress every stage's recall for no good reason.
         if created[target] >= created[num]:
             counts["canonical_newer_than_query"] += 1
             continue
@@ -117,19 +109,15 @@ def build(conn) -> dict:
             "created_at": created[num].isoformat(),
         })
 
-    # Time-ordered split. Chronological rather than random on purpose: stage 5b
-    # fine-tunes on duplicate pairs, and a random split would let it learn from
-    # pairs that postdate its own test queries. Chronological also mirrors how
-    # the system would actually be used -- train on history, answer new issues.
+    # Chronological split, not random: stage 5b fine-tunes on these pairs, and a
+    # random split would let it train on pairs postdating its own test queries.
     pairs.sort(key=lambda p: (p["created_at"], p["duplicate"]))
     cut = int(len(pairs) * (1 - TEST_FRACTION))
     for i, p in enumerate(pairs):
         p["split"] = "train" if i < cut else "test"
 
-    # How often is the canonical itself a duplicate? A -> B -> C chains are left
-    # intact: B is a real issue in the corpus and retrieving it for query A is
-    # what a maintainer marked as correct. Recorded because it is a judgement
-    # call someone could reasonably challenge.
+    # A -> B -> C chains are kept: B is a real issue and a maintainer marked it
+    # correct for A. Counted here because it is a debatable call.
     dup_set = set(dup_ids)
     chained = sum(1 for p in pairs if p["canonical"] in dup_set)
 

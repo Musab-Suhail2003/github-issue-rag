@@ -1,17 +1,11 @@
 """GitHub GraphQL ingestion -> MariaDB.
 
-Three modes:
-
     python -m src.fetch                  # backfill the corpus window (resumable)
-    python -m src.fetch --since auto     # incremental refresh from fetch_state
+    python -m src.fetch --since auto     # incremental refresh
     python -m src.fetch --numbers 1,2,3  # top up specific issues
 
-Why the `issues` connection rather than `search`: search caps at 1,000 results
-per query, so covering 85k issues through it would mean slicing the date range
-into windows and hoping none exceeds the cap. The connection cursors the whole
-set. It also excludes pull requests by construction -- `issues` and
-`pullRequests` are separate connections -- which is the guarantee CLAUDE.md asks
-for.
+Uses the `issues` connection, not `search`: search caps at 1,000 results, and
+`issues` excludes pull requests by construction.
 """
 
 from __future__ import annotations
@@ -45,10 +39,8 @@ fragment IssueFields on Issue {
 }
 """
 
-# comments(last: 20) is deliberate. The duplicate declaration that stage 2 needs
-# is essentially always the closing comment, and `last` puts the end of the
-# thread in reach without paginating every thread. comment_count vs
-# comments_fetched records exactly where that truncation bites.
+# last: 20 because the duplicate declaration is almost always the closing
+# comment. comment_count vs comments_fetched records where this truncates.
 
 Q_BACKFILL = ISSUE_FIELDS + """
 query Backfill($cursor: String, $pageSize: Int!) {
@@ -102,7 +94,7 @@ def gql(session: requests.Session, query: str, variables: dict, tries: int = 5) 
 
 
 def respect_rate_limit(rl: dict) -> None:
-    """GraphQL points regenerate hourly; sleeping beats a 403 mid-crawl."""
+    """Sleep until the hourly budget resets rather than eat a 403."""
     if rl and rl.get("remaining", 9999) < 150:
         reset = datetime.fromisoformat(rl["resetAt"].replace("Z", "+00:00"))
         wait = max(0, (reset - datetime.now(timezone.utc)).total_seconds()) + 5
@@ -113,15 +105,13 @@ def respect_rate_limit(rl: dict) -> None:
 def ts(value: str | None) -> datetime | None:
     if not value:
         return None
-    # Store naive UTC: MariaDB DATETIME is timezone-less and every timestamp
-    # from the API is already UTC, so carrying tzinfo would only invite
-    # comparison bugs against CORPUS_START.
+    # Naive UTC: MariaDB DATETIME has no timezone and the API is all UTC.
+    # Keeping tzinfo would break comparisons against CORPUS_START.
     return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
 def clean(text: str | None) -> str | None:
-    # NUL bytes appear occasionally in pasted terminal output and upset both the
-    # connector and downstream tokenisers.
+    # NUL bytes show up in pasted terminal output and break the driver.
     return text.replace("\x00", "") if text else text
 
 
@@ -150,7 +140,7 @@ def write_batch(conn, nodes: list[dict]) -> None:
         comments.extend(c)
         labels.extend(l)
     db.upsert_issues(conn, issues)
-    # Labels and comments carry a FK to issues, so issues must land first.
+    # Issues first -- comments and labels have a FK to them.
     db.replace_labels(conn, [i[0] for i in issues], labels)
     db.upsert_comments(conn, comments)
 
@@ -163,9 +153,8 @@ def crawl(conn, session, mode: str, since: datetime | None,
     if cursor:
         print(f"resuming {mode} from saved cursor")
 
-    # Watermark is taken BEFORE the crawl starts, not after. An issue updated
-    # while the crawl is running would otherwise fall in the gap between the
-    # page we already passed and a watermark set at the end.
+    # Watermark taken BEFORE the crawl. If set at the end, an issue updated
+    # mid-crawl would fall in the gap and never be seen again.
     started = datetime.now(timezone.utc)
 
     total = skipped = page = 0
@@ -183,13 +172,13 @@ def crawl(conn, session, mode: str, since: datetime | None,
             for node in nodes:
                 created, updated = ts(node["createdAt"]), ts(node["updatedAt"])
                 if mode == "backfill" and created < CORPUS_START:
-                    stop = True  # ordered CREATED_AT DESC, so everything after is older
+                    stop = True  # sorted newest-first, so the rest is older too
                     break
                 if mode == "since" and updated < since:
                     stop = True  # ordered UPDATED_AT DESC
                     break
                 if created < CORPUS_START:
-                    skipped += 1  # touched recently but outside the corpus window
+                    skipped += 1  # updated recently but filed before the bound
                     continue
                 keep.append(node)
 
@@ -200,7 +189,7 @@ def crawl(conn, session, mode: str, since: datetime | None,
             page += 1
             cursor = conn_block["pageInfo"]["endCursor"]
             db.set_state(conn, cursor_key, None if stop else cursor)
-            conn.commit()  # checkpoint: a kill here costs at most one page
+            conn.commit()  # checkpoint -- a crash costs one page
 
             rl = data.get("rateLimit") or {}
             rate = total / max(1e-6, time.time() - t0)
@@ -234,12 +223,10 @@ def crawl(conn, session, mode: str, since: datetime | None,
 
 
 def fetch_numbers(conn, session, numbers: list[int], chunk: int = 40) -> int:
-    """Fetch specific issue numbers regardless of the date bound.
+    """Fetch specific issue numbers, ignoring the date bound.
 
-    This is the escape hatch for the open question in NOTES.md: 22.7% of
-    duplicate pairs point at a canonical created before 2024-01-01. If those are
-    later admitted to the corpus, this is a short top-up run rather than a
-    refetch of everything.
+    Escape hatch for admitting pre-2024 canonical targets later without
+    refetching everything.
     """
     written = 0
     for i in range(0, len(numbers), chunk):

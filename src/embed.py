@@ -1,21 +1,14 @@
 """Stage 3: encode issues into 384-dim vectors.
 
-Three modes, because the encoding runs on Colab (GPU) while the database lives
-on the laptop:
+Split into three modes because encoding runs on Colab while the database is
+local:
 
     python -m src.embed --export-texts texts.jsonl.gz    # laptop: dump what is missing
     python -m src.embed --encode texts.jsonl.gz -o out/  # Colab: GPU encode -> shards
     python -m src.embed --import-vectors out/            # laptop: load into MariaDB
 
-`sentence_transformers` and `torch` are imported **inside** the encode path only.
-Export and import must run on a machine with neither installed, which is exactly
-the laptop this project develops on.
-
-Checkpointing is by issue number, in both directions:
-  * export emits only issues with no row in `embeddings` for this model, so a
-    re-run after a partial import ships only the remainder;
-  * encode writes numbered shards as it goes, so a reclaimed Colab runtime costs
-    one shard rather than the whole run.
+Resumable both ways: export skips issues that already have a vector, encode
+writes numbered shards so a dropped Colab session loses one shard.
 """
 
 from __future__ import annotations
@@ -28,20 +21,16 @@ from pathlib import Path
 
 import numpy as np
 
-# NOTE: `src.db` is imported inside the functions that need it, not here. The
-# --encode mode runs on a bare Colab runtime with no PyMySQL and no .env, and a
-# module-level import would make the GPU step depend on the database layer for
-# no reason. This file is uploadable to Colab as-is.
+# src.db is imported inside functions, not here, so --encode runs on a bare
+# Colab runtime with no PyMySQL and no .env. Upload this file to Colab as-is.
 
-# The Hub id and the short key stored in the DB. The key must be ASCII and <= 48
-# chars -- see the vector-index primary-key limit in schema.sql.
+# MODEL_KEY goes in the DB and must be ASCII, <= 48 chars (see schema.sql).
 MODEL_ID = "BAAI/bge-small-en-v1.5"
 MODEL_KEY = "bge-small-en-v1.5"
 DIM = 384
 
-# bge-small truncates at 512 tokens (~2k chars of English). Shipping more to
-# Colab would be bandwidth the model discards unread. db.issue_text() is the
-# shared composition; this is only where it gets cut.
+# bge-small reads 512 tokens (~2k chars). Anything longer is discarded by the
+# model, so there is no point shipping it to Colab.
 MAX_CHARS = 2000
 
 SHARD_SIZE = 10_000
@@ -72,9 +61,8 @@ def export_texts(conn, path: Path, limit: int | None = None) -> int:
                 for number, title, body in rows:
                     text = db.issue_text(title, body, max_chars=MAX_CHARS)
                     if not text.strip():
-                        # A handful of issues are titled with a single invisible
-                        # character and have no body. Encoding whitespace yields a
-                        # meaningless vector; skip and let them be unretrievable.
+                        # A few issues are a single invisible character with no
+                        # body. A vector for whitespace is meaningless.
                         continue
                     fh.write(json.dumps({"n": number, "t": text}) + "\n")
                     written += 1
@@ -106,10 +94,9 @@ def encode(texts_path: Path, out_dir: Path, batch_size: int = 64) -> None:
         vectors = model.encode(
             [r["t"] for r in chunk],
             batch_size=batch_size,
-            # Retrieval here is symmetric -- both sides are issue text. bge's
-            # "Represent this sentence for searching relevant passages:" prefix
-            # is for short-query-against-long-passage and would hurt here.
-            normalize_embeddings=True,  # makes cosine similarity a plain dot product
+            # No bge query prefix: both sides are issue text, so retrieval is
+            # symmetric. The prefix is for short-query-vs-long-passage.
+            normalize_embeddings=True,  # lets cosine be a plain dot product
             show_progress_bar=True,
             convert_to_numpy=True,
         ).astype(np.float32)
@@ -122,9 +109,8 @@ def encode(texts_path: Path, out_dir: Path, batch_size: int = 64) -> None:
 def import_vectors(conn, out_dir: Path, chunk: int = 500) -> int:
     """Load shards into MariaDB.
 
-    Vectors are sent as raw little-endian float32 bytes. MariaDB's VECTOR type
-    is exactly that on the wire, so this avoids VEC_FromText() and the ~4KB of
-    text-formatted floats per row it would otherwise parse.
+    Sends raw little-endian float32 bytes, which is MariaDB's VECTOR wire
+    format -- avoids VEC_FromText() parsing ~4KB of text per row.
     """
     from src import db  # noqa: PLC0415
 

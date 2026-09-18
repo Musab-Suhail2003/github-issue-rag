@@ -1,16 +1,9 @@
 """Stage 3: vector search.
 
-Two retrieval paths, both worth having:
+Two paths: `VectorRetriever` (exact brute-force numpy, used by the eval and the
+Space) and `MariaDBVectorRetriever` (HNSW index, kept for comparison).
 
-  * `VectorRetriever` -- brute-force cosine in numpy. Exact, and the time filter
-    is free. This is what the eval and the Space use.
-  * `MariaDBVectorRetriever` -- MariaDB's HNSW vector index. Approximate, and
-    the time filter is the problem described below.
-
-The encoder is **injected**, never constructed here. The Space passes a live
-sentence-transformers model; the eval passes precomputed vectors. That keeps
-torch out of the scoring path, which matters because this project's laptop has
-no torch installed -- encoding happens on Colab.
+The encoder is passed in rather than built here, so scoring never imports torch.
 """
 
 from __future__ import annotations
@@ -26,11 +19,10 @@ from src.embed import DIM, MAX_CHARS, MODEL_ID, MODEL_KEY
 # ------------------------------------------------------------------ encoders
 
 class PrecomputedEncoder:
-    """Look up an already-computed vector by its exact text.
+    """Return a stored vector by its exact text.
 
-    Lets the eval score a retriever without loading a model. The key is the text
-    truncated exactly as embed.py truncated it -- otherwise the query string and
-    the embedded string differ and every lookup misses.
+    Lets the eval run without loading a model. Truncates the key the same way
+    embed.py did, or every lookup misses.
     """
 
     def __init__(self, text_to_vec: dict[str, np.ndarray]):
@@ -60,16 +52,15 @@ class PrecomputedEncoder:
 
 
 class ModelEncoder:
-    """Live sentence-transformers encoding. Only this path needs torch."""
+    """Encode with the real model. The only class here that needs torch."""
 
     def __init__(self, model_id: str = MODEL_ID):
         from sentence_transformers import SentenceTransformer  # noqa: PLC0415
         self.model = SentenceTransformer(model_id)
 
     def __call__(self, text: str) -> np.ndarray:
-        # normalize_embeddings=True and no bge query prefix -- must match
-        # embed.py exactly, or query and document vectors live in different
-        # spaces and the numbers measure that instead of the model.
+        # Must match embed.py exactly -- same normalisation, no query prefix --
+        # or queries and documents end up in different spaces.
         return self.model.encode(
             text[:MAX_CHARS], normalize_embeddings=True, convert_to_numpy=True
         ).astype(np.float32)
@@ -78,12 +69,10 @@ class ModelEncoder:
 # ------------------------------------------------------------------ retrievers
 
 class VectorRetriever:
-    """Brute-force cosine over the whole corpus.
+    """Exact cosine search over the whole corpus.
 
-    At 84,942 x 384 float32 the matrix is ~124MB and one query is a single
-    matmul -- a few milliseconds. Exact, no index to tune, and crucially the
-    `before_date` filter costs nothing: vectors are held in created_at order, so
-    the time filter is a slice, not a scan.
+    The matrix is ~124MB, so a query is one matmul. Vectors are held in
+    created_at order, which makes the before_date filter a slice.
     """
 
     def __init__(self, conn, encoder, model_name: str = MODEL_KEY):
@@ -117,36 +106,27 @@ class VectorRetriever:
         q = self.encoder(query_text)
         if q is None:
             return []
-        # Strictly before: an issue created at the same instant as the query
-        # could not have informed it.
+        # Strictly before -- an issue filed at the same instant is not an answer.
         cutoff = int(np.searchsorted(self.dates, np.datetime64(before_date), side="left"))
         if cutoff == 0:
             return []
-        # Vectors are L2-normalised at encode time, so a dot product IS cosine
-        # similarity -- no division, no norms recomputed per query.
+        # Vectors are L2-normalised, so the dot product is already cosine.
         sims = self.matrix[:cutoff] @ q
         k = min(n, cutoff)
-        # argpartition is O(N) vs O(N log N) for a full sort; we only need the
-        # top k ordered, not all 85k.
+        # argpartition finds the top k in O(N); sorting all 85k would be wasteful.
         top = np.argpartition(-sims, k - 1)[:k]
         top = top[np.argsort(-sims[top])]
         return [int(self.numbers[i]) for i in top]
 
 
 class MariaDBVectorRetriever:
-    """HNSW path, via MariaDB's VECTOR INDEX.
+    """Search via MariaDB's HNSW vector index.
 
-    Kept because it is the production-shaped answer at scales where a 124MB
-    matrix in RAM stops being reasonable -- and because the comparison is worth
-    measuring rather than asserting.
-
-    The catch, and it is the interesting part: MariaDB only uses the vector
-    index for a bare `ORDER BY VEC_DISTANCE_COSINE(...) LIMIT n`. Add
-    `WHERE created_at < ?` and the index cannot serve the query, so it silently
-    becomes a full scan -- no error, just slow. The workaround here is to
-    over-fetch `n * overfetch` neighbours with the bare indexed query and filter
-    by date afterwards, which is approximate in a second way: if enough of the
-    nearest neighbours postdate the query, fewer than n survive.
+    MariaDB only uses the index for a bare ORDER BY VEC_DISTANCE_COSINE(...)
+    LIMIT n. Adding WHERE created_at < ? silently turns it into a full scan, so
+    this over-fetches n*overfetch neighbours and date-filters afterwards. That
+    is approximate twice over: if enough neighbours postdate the query, fewer
+    than n survive.
     """
 
     def __init__(self, conn, encoder, model_name: str = MODEL_KEY, overfetch: int = 10):
@@ -179,7 +159,7 @@ class MariaDBVectorRetriever:
 
 
 def explain_index_usage(conn, model_name: str = MODEL_KEY) -> str:
-    """Confirm the vector index is actually used. CLAUDE.md asks for this."""
+    """Check the index is really used and not silently skipped."""
     probe = np.zeros(DIM, dtype="<f4")
     probe[0] = 1.0
     with db.cursor(conn) as cur:
@@ -216,3 +196,4 @@ if __name__ == "__main__":
         print(explain_index_usage(conn))
     finally:
         conn.close()
+    

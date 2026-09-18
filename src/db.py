@@ -1,14 +1,8 @@
-"""MariaDB connection handling and idempotent upserts.
+"""MariaDB connection and idempotent upserts. Batch side only -- the Space
+never imports this.
 
-Everything here is write-side batch work. Nothing in the serving path imports
-this module -- per CLAUDE.md the Space reads exported artifacts only.
-
-Driver: PyMySQL, not mysql-connector-python. Both are sanctioned by CLAUDE.md,
-and this project started on mysql-connector. It was swapped after
-mysql-connector 26.7.0 failed a 50-row upsert (600 bound parameters plus
-ON DUPLICATE KEY UPDATE ... VALUES(col)) with a 1064 syntax error, every time,
-on both its C-extension and pure-Python paths. PyMySQL executed the identical
-statement with the identical parameters 12/12. Details in NOTES.md.
+Uses PyMySQL because mysql-connector corrupts large multi-row upserts. See
+NOTES.md, stage 1.
 """
 
 from __future__ import annotations
@@ -55,11 +49,9 @@ def cursor(conn, dictionary: bool = False):
 
 
 def init_schema(conn) -> None:
-    """Apply schema.sql.
+    """Apply schema.sql. Safe to re-run.
 
-    Statements are split manually rather than passed with multi=True: that
-    argument was removed in mysql-connector-python 9.x. Safe here because the
-    schema contains no stored routines, so no semicolons appear inside a body.
+    Splits on ";" -- fine because the schema has no stored routines.
     """
     sql = SCHEMA_PATH.read_text()
     sql = re.sub(r"^\s*--.*$", "", sql, flags=re.M)  # strip comment lines
@@ -72,23 +64,9 @@ def init_schema(conn) -> None:
 
 # ---------------------------------------------------------------- upserts
 
-# Multi-row INSERTs are built by hand and sent through a single execute(),
-# rather than handed to cursor.executemany().
-#
-# This is not premature optimisation -- executemany() is actively broken here.
-# mysql-connector-python rewrites an executemany INSERT into one multi-row
-# statement using a regex to locate the VALUES clause, and
-# `ON DUPLICATE KEY UPDATE title=VALUES(title)` makes that regex match the
-# wrong VALUES(...). The result is the issue body interpolated into the SQL as
-# raw text instead of bound as a parameter -- a syntax error on any body the
-# rewriter mangles, and a latent injection shape if it ever parsed. Binding the
-# parameters ourselves sidesteps the rewriter entirely and still costs one
-# round trip per chunk.
-#
-# ON DUPLICATE KEY UPDATE rather than INSERT IGNORE: a re-run should *refresh* a
-# row (an issue's state, labels and comment count all change over time), not
-# silently skip it. This is what makes an interrupted 1,700-request crawl safe
-# to simply restart.
+# ON DUPLICATE KEY UPDATE, not INSERT IGNORE: re-running should refresh a row,
+# since state, labels and comment counts change over time. That is what makes an
+# interrupted crawl safe to restart.
 
 _ISSUE_COLS = ("number", "title", "body", "state", "state_reason", "author", "url",
                "created_at", "updated_at", "closed_at", "comment_count",
@@ -103,10 +81,10 @@ _COMMENT_UPDATE = ("author", "body")
 def _bulk(conn, table: str, cols: Sequence[str], rows: Sequence[tuple],
           update: Sequence[str] = (), ignore: bool = False,
           chunk: int = 100) -> int:
-    """One INSERT per chunk, parameters bound by the driver.
+    """One INSERT per chunk of rows.
 
-    chunk is kept modest because bodies are MEDIUMTEXT: a few very large issues
-    in one statement could otherwise approach max_allowed_packet.
+    chunk stays small because bodies are MEDIUMTEXT and a big batch can approach
+    max_allowed_packet.
     """
     if not rows:
         return 0
@@ -135,10 +113,10 @@ def upsert_comments(conn, rows: Sequence[tuple]) -> int:
 
 
 def replace_labels(conn, issue_numbers: Iterable[int], rows: Sequence[tuple]) -> int:
-    """Delete-then-insert per issue.
+    """Replace an issue's labels.
 
-    Labels are genuinely removed during triage, so a pure insert would leave
-    stale rows behind and quietly corrupt any metadata filter built on them.
+    Deletes first because labels get removed during triage; inserting alone
+    would leave stale rows.
     """
     nums = list(issue_numbers)
     if nums:
@@ -154,15 +132,10 @@ def replace_labels(conn, issue_numbers: Iterable[int], rows: Sequence[tuple]) ->
 # ---------------------------------------------------------------- text
 
 def issue_text(title: str | None, body: str | None, max_chars: int = 8000) -> str:
-    """The canonical text representation of an issue.
+    """Turn an issue into the one text string everything else uses.
 
-    Lives here, in the data layer, so that eval.py and embed.py cannot drift
-    apart. If the query side and the document side compose text differently, the
-    retrieval numbers are measuring that discrepancy as much as the model.
-
-    Truncation is a floor-level guard against the handful of issues with enormous
-    pasted logs; bge-small's context window is 512 tokens, so stage 3 will
-    truncate far more aggressively than this. Field-aware handling is stage 6.
+    Shared by eval.py and embed.py so the query side and document side can never
+    compose text differently.
     """
     parts = [(title or "").strip()]
     if body:
