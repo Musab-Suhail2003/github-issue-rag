@@ -23,14 +23,16 @@ The ablation table is the deliverable.
 
 | | |
 |---|---|
-| corpus | 84,877 issues, created ≥ 2024-01-01 |
-| duplicate-marked | 8,038 |
-| usable labelled pairs | ~2,507 |
-| canonical extractable from comments | 40.4% |
+| corpus | **84,942** issues ingested, created ≥ 2024-01-01 |
+| duplicate-marked | 8,045 |
+| usable labelled pairs | **3,194** (measured in DB; stage 0 estimated 2,507) |
+| canonical extractable from comments | 46.4% |
 | canonical is an Issue, not a PR | 100% |
-| canonical inside the date window | 77.3% |
+| canonical inside the date window | 85.6% |
 | embedding size | 384 dims × 84,877 ≈ 130MB float32 |
 | median issue body | 1,773 chars (p90 4,472) |
+| comments ingested | 208,753 (avg 2.56/issue) |
+| database on disk | ~400MB |
 
 ---
 
@@ -111,6 +113,63 @@ pattern that assumed a bare `#`. Fixing it moved extraction 37.6% → 40.4%.
 ---
 
 ## Stage 1 — decisions you must be able to defend
+
+### "Your stage 0 estimate was off by 27%. Doesn't that undermine the probe?"
+
+Worth having a straight answer, because the honest one is better than a defence.
+
+Stage 0 sampled 545 issues and projected ~2,507 usable pairs. The real ingested
+corpus yields **3,194**. Both underlying rates came in higher than sampled:
+extraction 46.4% vs 40.4%, canonical-in-corpus 85.6% vs 77.3%.
+
+It doesn't undermine the probe, for two reasons. First, the probe's job was a
+go/no-go on whether enough labelled pairs existed at all — the threshold was 300
+and the answer was "thousands" either way. Second, **the error was in the
+conservative direction**, which is the right way for a feasibility estimate to be
+wrong.
+
+The likely cause is interesting and I'd volunteer it: the probe deliberately
+sampled from both ends of each year to guard against the triage bot's wording
+drifting over time. But issues near a year boundary are disproportionately likely
+to point at a canonical filed in the *previous* year — outside the corpus window.
+So the stratification that protected against one bias introduced another. I'd
+flag that as a hypothesis I haven't separately verified, not a conclusion.
+
+The general point: a sample of 545 gives roughly ±4% on a rate. If a decision
+needed better precision than that, the probe was the wrong instrument.
+
+### "How do you know fetching only 20 comments per issue didn't lose you data?"
+
+Because I stored `comment_count` (the API's true total) next to
+`comments_fetched` (what I actually kept), which makes the question answerable
+instead of a guess.
+
+Of 84,942 issues, **436 (0.5%)** have more comments than I fetched. Among the
+8,045 duplicate-marked issues — the only ones the test set draws from — it's
+**31 (0.4%)**. Average thread length is 2.56 comments and 14,481 issues have none
+at all. Paginating every thread in full would have multiplied the request count
+to recover almost nothing.
+
+The part worth adding: this is fine *for duplicate detection* and will need
+revisiting at stage 7, where Q&A over comment threads cares specifically about
+the long tail that duplicate detection ignores. Knowing which 436 issues are
+truncated means that's a targeted top-up, not a re-fetch.
+
+### "How did you verify the ingestion was correct?"
+
+I probed the API in stage 0 and counted the same quantities in the database in
+stage 1, then compared. Independent paths to the same numbers:
+
+| | probe (API) | DB |
+|---|---|---|
+| issues | 84,877 | 84,942 |
+| `label:*duplicate` | 5,370 | 5,373 |
+| `reason:duplicate` | 3,194 | 3,198 |
+| overlap | 526 | 526 |
+
+The small surplus is issues filed in the hours between the two runs. Plus
+integrity checks: zero orphaned comments, zero rows outside the date bound, zero
+null bodies.
 
 ### "Tell me about a bug you had to actually debug."
 

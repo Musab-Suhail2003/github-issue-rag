@@ -132,3 +132,130 @@ PATTERNS = [
 Resolve targets with `repository.issueOrPullRequest(number:)`, **not**
 `repository.issue(number:)` — the latter returns `null` for a PR number, making
 "target is a PR" indistinguishable from "target was deleted".
+
+---
+
+## Stage 1 — Schema + GraphQL ingestion (2026-09-18)
+
+**Goal:** get the corpus into MariaDB, idempotently and resumably.
+
+**Rule 2 note:** there is no retrieval yet, so no recall/MRR. Stage 1's number is
+the **usable labelled pair count** the ingestion actually yields — that is the
+quantity every later stage's eval depends on, and it is measured below rather
+than carried forward from stage 0's estimate.
+
+**Config:** `repository.issues` connection, `orderBy CREATED_AT DESC`, page size
+50, `comments(last: 20)`, `labels(first: 30)`. ~1,700 requests, ~1,700 of the
+5,000/hr GraphQL point budget, sustained ~25 issues/sec. Elapsed span 125 min,
+which includes the restarts from the driver bug below; the clean crawl was
+roughly 60 min.
+
+### What landed
+
+| | |
+|---|---|
+| issues | **84,942** |
+| comments | 208,753 |
+| label rows / distinct labels | 133,799 / 627 |
+| created range | 2024-01-01 00:54:06 → 2026-09-18 02:18:06 |
+| on disk | issues 228MB + comments 158MB + labels 13MB ≈ **400MB** |
+
+### Validation against stage 0
+
+Stage 0 probed the API; stage 1 counts the same things in the database. They
+agree, which is the point of doing both.
+
+| | stage 0 (probe) | stage 1 (DB) |
+|---|---|---|
+| issues in window | 84,877 | 84,942 |
+| `label:*duplicate` | 5,370 | 5,373 |
+| `reason:duplicate` | 3,194 | 3,198 |
+| overlap | 526 | 526 |
+| union | 8,038 | 8,045 |
+
+The small surplus is issues created in the hours between the probe and the fetch.
+
+### Usable pairs — the number that matters
+
+Running stage 0's regex battery over the ingested `comments` table:
+
+```
+duplicate-marked in DB                8,045
+x canonical extractable (strong)      46.4%   (3,733)
+x canonical resolves to an ingested issue  85.6%
+--------------------------------------------
+USABLE PAIRS                          3,194     (stage 0 estimated ~2,507)
+```
+
+Pattern split: `dup_of` 1,871 · `dup_colon` 1,784 · `tracked_in` 78 ·
+`NO_MATCH` 4,312 (53.6%).
+
+**Stage 0's estimate was conservative by 27%.** Both factors came in higher:
+extraction 46.4% vs 40.4%, in-corpus 85.6% vs 77.3%. Sampling error on n=545
+explains part of it; the likely remainder is that the stage 0 sample drew
+deliberately from both ends of each year, and issues near a year boundary are
+more likely to point at a canonical from the previous year — i.e. the
+stratification that protected against bot-wording drift biased the in-corpus
+rate downward. Stated as a hypothesis; not separately verified.
+
+539 extracted canonicals point outside the corpus (pre-2024, or a PR). That is
+the open decision from stage 0, still open, and `fetch.py --numbers` exists to
+close it cheaply if wanted.
+
+### Truncation — was `comments(last: 20)` the right call?
+
+Yes, measurably. Of 84,942 issues only **436 (0.5%)** have more comments than
+were fetched, and among the 8,045 duplicate-marked issues only **31 (0.4%)**.
+Average thread is 2.56 comments; 14,481 issues have none at all. Paginating full
+threads would have multiplied request count to recover almost nothing that stage
+2 needs. `comment_count` vs `comments_fetched` makes this checkable rather than
+assumed — and stage 7 will need to revisit it, since Q&A over threads cares about
+the long tail that duplicate detection does not.
+
+### Integrity
+
+0 orphan comments · 0 issues before the date bound · 0 null bodies ·
+2 "empty" titles, which turn out to be real issues titled with a single
+invisible character (U+200B zero-width space, U+200E left-to-right mark).
+
+### Driver: mysql-connector-python → PyMySQL
+
+The first backfill died at ~250 issues with MariaDB error 1064, the message
+containing a fragment of an issue body — the body was reaching the server as SQL
+rather than as a bound parameter.
+
+Two wrong diagnoses before the right one:
+
+1. *`executemany` statement rewriting.* Plausible — mysql-connector rewrites
+   multi-row INSERTs with a regex, and `ON DUPLICATE KEY UPDATE title=VALUES(title)`
+   gives that regex a second `VALUES(...)` to match. Replacing `executemany` with
+   a hand-built multi-row INSERT failed identically.
+2. *Bad characters in the body.* Tested `%`, `%s`, quotes, backslashes, escaped
+   and real newlines, emoji, plus the offending row alone and with each
+   neighbour. All fine.
+
+Bisecting on batch size found it: 1 row OK, 25 OK, 50 fails. Statement template
+2,337 bytes, 600 bound parameters — so neither statement length nor
+`max_allowed_packet` (16MB) was involved. Controlled comparison, identical rows
+and identical statement:
+
+| driver | result |
+|---|---|
+| mysql-connector-python 26.7.0 (C ext **and** pure Python) | ok=0, fail=12 |
+| PyMySQL 1.2.3 | ok=12, fail=0 |
+
+Switched to PyMySQL, which CLAUDE.md already sanctioned. Worth recording that a
+driver interpolating a parameter instead of binding it is an injection shape —
+here the input came from the GitHub API rather than a user, so it surfaced as a
+crash, but that driver does not belong near untrusted input.
+
+**The checkpointing paid for itself.** The crash cost zero rows; the cursor in
+`fetch_state` was current and the re-run resumed from the failing page.
+
+### Also from this stage
+
+- `both` is a reserved word in MariaDB — cost one confusing 1064 while writing
+  verification queries, which is the same error code as the driver bug and
+  briefly muddied the diagnosis.
+- `scripts/probe.py` deleted per CLAUDE.md. It survives in git history at
+  commit `67b90a9`, and its regex battery is preserved above.
