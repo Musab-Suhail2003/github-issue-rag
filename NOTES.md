@@ -713,3 +713,148 @@ ALTER TABLE embeddings ADD VECTOR INDEX (vec) DISTANCE=cosine;
 are useless. It is evidence that at 85k × 384 they lose to a brute-force matmul
 that fits in 124MB of RAM, and that index maintenance during bulk load is the
 dominant cost when it is kept anyway.
+
+---
+
+## Stage 5b — Contrastive fine-tuning (2026-09-19)
+
+**Config:** `BAAI/bge-small-en-v1.5` fine-tuned with
+`MultipleNegativesRankingLoss`, 2,000 train pairs (12 dropped where either side
+was under 20 chars), 3 epochs, batch 32, lr 2e-5, 150 pairs held out from train
+for validation. Cleaned text per stage 6a. Colab T4. Test split untouched.
+
+### The number
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| dense, raw text (stage 3) | 0.1230 | 0.2123 | 0.2778 | 0.1627 |
+| dense, boilerplate stripped (6a) | 0.1230 | 0.2440 | 0.3016 | 0.1747 |
+| **dense, fine-tuned** | **0.1329** | **0.2540** | **0.3194** | **0.1844** |
+
+**Best result in the project: recall@10 0.3194, MRR 0.1844** — +4.2 points of
+recall@10 over the stage 3 baseline (+15% relative), and the first change to move
+recall@1 at all.
+
+Sanity check before trusting it: mean cosine between fine-tuned and base vectors
+is **0.870** (min 0.704, max 0.989). The model moved substantially without
+collapsing to a degenerate solution.
+
+### Significance — the careful version
+
+McNemar exact on recall@10, 504 paired queries:
+
+| comparison | gained | lost | net | p | verdict |
+|---|---|---|---|---|---|
+| **fine-tuned vs raw baseline** | 40 | 19 | **+21** | **0.0086** | **significant** |
+| fine-tuned vs clean | 23 | 14 | +9 | 0.1877 | not significant |
+| clean vs raw baseline | 25 | 13 | +12 | 0.0730 | not significant |
+
+**Neither step is individually significant; the pipeline as a whole is.**
+
+That is the honest claim and it should be stated that way in the README:
+*"boilerplate stripping plus contrastive fine-tuning improves recall@10 from
+0.2778 to 0.3194 (p=0.0086); the individual contributions are not separable at
+n=504."* Writing "fine-tuning improved recall by 1.8 points" would be
+unsupported — that comparison is p=0.19.
+
+To attribute the steps individually would need a larger test split, which is
+available: 2,012 pairs currently sit in train. That is a real trade — more test
+power versus less training data — and at 2k pairs the fine-tune is already
+data-starved.
+
+### Field-aware hybrid — cleaning helps dense and hurts BM25
+
+Stage 6a stripped boilerplate for dense. Running BM25 over the same cleaned text
+made it **worse**:
+
+| | recall@10 | MRR |
+|---|---|---|
+| bm25, raw text | 0.2143 | 0.1423 |
+| bm25, cleaned text | 0.1746 | 0.0993 |
+
+**−4.0 points from removing boilerplate.** The two retrievers want opposite
+preprocessing, which is worth understanding rather than averaging away: version
+strings, OS builds and extension versions are *rare literal tokens*, exactly what
+BM25's idf weighting rewards. "Same VS Code build, same crash" is a real duplicate
+signal. Dense retrieval cannot exploit repeated near-identical text and is
+actively hurt by it; BM25 is helped.
+
+So each retriever was given the representation it measurably prefers:
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| hybrid, both on raw | 0.1290 | 0.2222 | 0.2540 | 0.1664 |
+| hybrid, both on clean | 0.1270 | 0.2440 | 0.2798 | 0.1736 |
+| **mixed: dense-clean + bm25-raw** | **0.1369** | 0.2321 | 0.2817 | 0.1779 |
+
+**Best recall@1 measured anywhere in the project (0.1369).** Field-aware
+preprocessing beats either uniform choice — which is the stage 6 thesis,
+confirmed on a specific mechanism rather than asserted.
+
+It still does not beat fine-tuned dense alone on recall@10 (0.2817 vs 0.3194),
+consistent with the stage 4 ceiling analysis: BM25 has too little unique signal
+to survive fusion.
+
+---
+
+## Stage 5 — Cross-encoder reranking (2026-09-19)
+
+**Config:** rerank the top 50 from the fine-tuned dense retriever. Scored on the
+same 504-pair test split. `bge-reranker-base` (278M) and `bge-reranker-v2-m3`
+(568M) run on a Colab T4; `ms-marco-MiniLM-L-6-v2` (22M) locally as the
+serving-size model.
+
+### The number — reranking hurts
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| **fine-tuned dense, no rerank** | **0.1329** | **0.2540** | **0.3194** | **0.1844** |
+| + bge-reranker-base (278M) | 0.1032 | 0.1944 | 0.2520 | 0.1447 |
+| + bge-reranker-v2-m3 (568M) | 0.0992 | 0.2044 | 0.2877 | 0.1479 |
+
+McNemar exact on recall@10 versus no reranking:
+
+| reranker | gained | lost | net | p |
+|---|---|---|---|---|
+| bge-reranker-base | 26 | 60 | **−34** | **0.0003 significant** |
+| bge-reranker-v2-m3 | 26 | 42 | −16 | 0.0681 |
+
+**Both rerankers make retrieval worse, and the smaller one significantly so.**
+
+### Why — and it is not a bug
+
+The fine-tuned bi-encoder was trained on 2,000 maintainer-marked vscode duplicate
+pairs. It has learned a specific question: *is this the same bug?*
+
+The cross-encoders are general-purpose relevance models trained on web-search
+data. They answer a different question: *is this document about this topic?*
+Those diverge exactly where duplicate detection is hard — a reranker will happily
+promote three topically-similar issues above the one that is the actual duplicate.
+
+The ordering supports this reading: the larger, more broadly trained v2-m3 hurts
+less (−3.2 points) than base (−6.7). More general training, less damage.
+
+**The headline: a 33M-parameter domain-adapted bi-encoder beats a 568M
+general-purpose cross-encoder by 3.2 points of recall@10.** Parameter count lost
+to task alignment, by a factor of 17 in model size.
+
+### What would have made reranking work
+
+Not tried, for time, but the diagnosis points somewhere specific: fine-tune the
+cross-encoder on the same 2,000 duplicate pairs. The bi-encoder gained from
+domain adaptation and there is no reason a cross-encoder would not. Using an
+off-the-shelf reranker on a task whose notion of relevance is *"duplicate of"*
+rather than *"relevant to"* is the actual mistake here.
+
+Recorded as the obvious next experiment rather than claimed as a result.
+
+### Stage 4's prediction was right
+
+Stage 4 recorded, before any of this: *"57.9% of queries have the canonical in
+neither retriever's top 50. Reranking cannot invent candidates, so stage 5 should
+be judged on MRR and recall@1, not recall@10."*
+
+It turned out worse than that: reranking did not merely fail to help within its
+ceiling, it actively reordered correct answers out of the top 10. But the
+framing — that the retrieval ceiling, not the ranking, was the binding
+constraint — was correct, and it is why the effort went into stage 5b first.

@@ -353,7 +353,7 @@ if __name__ == "__main__":
     dups = [d for d, _ in pairs]
     conn = db.connect()
     try:
-        for key in (MODEL_KEY, MODEL_KEY_CLEAN):
+        for key in (MODEL_KEY, MODEL_KEY_CLEAN, "bge-small-ft-dup"):
             with db.cursor(conn) as cur:
                 cur.execute("SELECT COUNT(*) FROM embeddings WHERE model_name=%s", (key,))
                 have = cur.fetchone()[0]
@@ -362,7 +362,8 @@ if __name__ == "__main__":
                 continue
             enc = PrecomputedEncoder.for_issues(conn, dups, key)
             r = VectorRetriever(conn, enc, key)
-            label = "raw text" if key == MODEL_KEY else "boilerplate stripped"
+            label = {MODEL_KEY: "raw text",
+                     MODEL_KEY_CLEAN: "boilerplate stripped"}.get(key, "FINE-TUNED")
             print(format_result(f"dense ({label})", evaluate(r, pairs)))
             del r, enc
 
