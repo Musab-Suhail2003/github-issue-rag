@@ -23,3 +23,6 @@ logs/
 # local-only working docs
 CLAUDE.md
 INTERVIEW.md
+
+# space/ is assembled by hand for reference; deployment is Streamlit Cloud
+space/

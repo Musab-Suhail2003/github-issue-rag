@@ -15,7 +15,11 @@ numpy==2.5.3
 # Stage 4 (BM25 + RRF)
 rank-bm25==0.2.2
 
-# Stage 5 (reranking) / stage 8 (serving). torch is the CPU-only build:
-#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+# Stage 5 (reranking) / stage 8 (serving).
+# The CPU wheel is pinned explicitly: the default torch pulls ~2.5GB of CUDA
+# libraries that a free host cannot use, which makes the build time out.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
 sentence-transformers==6.1.0
 streamlit==1.64.0
+huggingface-hub==1.32.0

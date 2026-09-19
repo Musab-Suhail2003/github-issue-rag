@@ -14,7 +14,11 @@ from pathlib import Path
 import numpy as np
 import streamlit as st
 
-ART = Path(__file__).parent / "artifacts"
+# Artifacts live in a public HF dataset rather than the git repo: 172MB is too
+# much for GitHub, and Streamlit Community Cloud deploys from GitHub. They are
+# downloaded once and cached on the container's disk.
+ARTIFACT_REPO = os.getenv("ARTIFACT_REPO", "Musab6969/vscode-issue-rag-artifacts")
+LOCAL_ART = Path(__file__).parent / "artifacts"
 # The stage 5b fine-tune. Override with MODEL_ID to fall back to the base model.
 MODEL_ID = os.getenv("MODEL_ID", "Musab6969/bge-small-vscode-dup")
 FALLBACK_MODEL = "BAAI/bge-small-en-v1.5"
@@ -24,11 +28,23 @@ st.set_page_config(page_title="VS Code duplicate issue finder",
                    page_icon="🔎", layout="wide")
 
 
+@st.cache_resource(show_spinner="Fetching index (~172MB, first run only)…")
+def artifact_dir() -> Path:
+    """Local artifacts if present (dev), otherwise the HF dataset (deployed)."""
+    if (LOCAL_ART / "embeddings.npy").exists():
+        return LOCAL_ART
+    from huggingface_hub import hf_hub_download
+    for f in ("embeddings.npy", "issue_ids.npy", "issues.sqlite", "manifest.json"):
+        path = hf_hub_download(ARTIFACT_REPO, f, repo_type="dataset")
+    return Path(path).parent
+
+
 @st.cache_resource(show_spinner="Loading index…")
 def load_index():
-    mat = np.load(ART / "embeddings.npy", mmap_mode="r")
-    ids = np.load(ART / "issue_ids.npy")
-    manifest = json.loads((ART / "manifest.json").read_text())
+    art = artifact_dir()
+    mat = np.load(art / "embeddings.npy", mmap_mode="r")
+    ids = np.load(art / "issue_ids.npy")
+    manifest = json.loads((art / "manifest.json").read_text())
     return mat, ids, manifest
 
 
@@ -45,7 +61,7 @@ def load_model():
 
 @st.cache_resource
 def meta_db():
-    return sqlite3.connect(ART / "issues.sqlite", check_same_thread=False)
+    return sqlite3.connect(artifact_dir() / "issues.sqlite", check_same_thread=False)
 
 
 def strip_boilerplate(body: str) -> str:
