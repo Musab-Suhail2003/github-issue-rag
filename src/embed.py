@@ -73,8 +73,13 @@ def export_texts(conn, path: Path, limit: int | None = None,
     return written
 
 
-def encode(texts_path: Path, out_dir: Path, batch_size: int = 64) -> None:
-    """GPU/CPU encode. The only mode that needs torch."""
+def encode(texts_path: Path, out_dir: Path, batch_size: int = 64,
+           model_id: str = MODEL_ID) -> None:
+    """GPU/CPU encode. The only mode that needs torch.
+
+    model_id can be a Hub name or a local directory, which is how the stage 5b
+    fine-tuned model gets used without changing anything else.
+    """
     from sentence_transformers import SentenceTransformer  # noqa: PLC0415
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -82,8 +87,8 @@ def encode(texts_path: Path, out_dir: Path, batch_size: int = 64) -> None:
     if done:
         print(f"resuming: {len(done)} shard(s) already present", file=sys.stderr)
 
-    model = SentenceTransformer(MODEL_ID)
-    print(f"{MODEL_ID} loaded, device={model.device}, "
+    model = SentenceTransformer(model_id)
+    print(f"{model_id} loaded, device={model.device}, "
           f"max_seq_length={model.max_seq_length}", file=sys.stderr)
 
     with gzip.open(texts_path, "rt", encoding="utf-8") as fh:
@@ -155,19 +160,22 @@ def main() -> None:
     ap.add_argument("-o", "--out", default="shards", help="shard dir for --encode")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--limit", type=int, help="export only N issues (smoke test)")
+    ap.add_argument("--model", default=MODEL_ID,
+                    help="Hub id or local dir (e.g. the stage 5b fine-tune)")
+    ap.add_argument("--model-key", help="model_name to store under in the DB")
     ap.add_argument("--clean", action="store_true",
                     help="strip template boilerplate; uses the -clean model key")
     args = ap.parse_args()
 
     if args.encode:
-        encode(Path(args.encode), Path(args.out), args.batch_size)
+        encode(Path(args.encode), Path(args.out), args.batch_size, args.model)
         return
 
     from src import db  # noqa: PLC0415
 
     conn = db.connect()
     try:
-        key = MODEL_KEY_CLEAN if args.clean else MODEL_KEY
+        key = args.model_key or (MODEL_KEY_CLEAN if args.clean else MODEL_KEY)
         if args.export_texts:
             n = export_texts(conn, Path(args.export_texts), args.limit, key, args.clean)
             size = Path(args.export_texts).stat().st_size / 1048576
