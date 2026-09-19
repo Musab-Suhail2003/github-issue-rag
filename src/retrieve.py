@@ -33,6 +33,12 @@ class PrecomputedEncoder:
     @classmethod
     def for_issues(cls, conn, numbers: list[int],
                    model_name: str = MODEL_KEY) -> "PrecomputedEncoder":
+        """Map the query text the eval will pass to that issue's stored vector.
+
+        The key is always the RAW text, because that is what eval.py composes.
+        The vector may have been built from cleaned text -- that is the point of
+        the comparison, and it is still the correct vector for this issue.
+        """
         if not numbers:
             return cls({})
         placeholders = ",".join(["%s"] * len(numbers))
@@ -268,7 +274,8 @@ class BM25Retriever:
     the retrieval method rather than how much text each side was given.
     """
 
-    def __init__(self, conn, tokenizer=tok_words, max_chars: int = MAX_CHARS):
+    def __init__(self, conn, tokenizer=tok_words, max_chars: int = MAX_CHARS,
+                 clean: bool = False):
         numbers, dates, docs = [], [], []
         with db.cursor(conn) as cur:
             cur.execute("SELECT number, title, body, created_at FROM issues "
@@ -280,7 +287,8 @@ class BM25Retriever:
                 for number, title, body, created in rows:
                     numbers.append(number)
                     dates.append(np.datetime64(created))
-                    docs.append(tokenizer(db.issue_text(title, body, max_chars)))
+                    docs.append(tokenizer(db.issue_text(title, body, max_chars,
+                                                        clean=clean)))
         self.tokenizer = tokenizer
         self.numbers = np.array(numbers, dtype=np.int64)
         self.dates = np.array(dates, dtype="datetime64[s]")
@@ -335,28 +343,35 @@ def explain_index_usage(conn, model_name: str = MODEL_KEY) -> str:
 
 
 if __name__ == "__main__":
-    import time
+    import sys
 
+    from src.embed import MODEL_KEY_CLEAN
     from src.eval import evaluate, format_result
     from src.testset import load
 
     pairs = load("test")
+    dups = [d for d, _ in pairs]
     conn = db.connect()
     try:
-        encoder = PrecomputedEncoder.for_issues(conn, [d for d, _ in pairs])
-        dense = VectorRetriever(conn, encoder)
-        print(f"corpus: {len(dense):,} vectors\n")
-        print(format_result("dense only", evaluate(dense, pairs)))
+        for key in (MODEL_KEY, MODEL_KEY_CLEAN):
+            with db.cursor(conn) as cur:
+                cur.execute("SELECT COUNT(*) FROM embeddings WHERE model_name=%s", (key,))
+                have = cur.fetchone()[0]
+            if not have:
+                print(f"{key}: not embedded yet, skipping")
+                continue
+            enc = PrecomputedEncoder.for_issues(conn, dups, key)
+            r = VectorRetriever(conn, enc, key)
+            label = "raw text" if key == MODEL_KEY else "boilerplate stripped"
+            print(format_result(f"dense ({label})", evaluate(r, pairs)))
+            del r, enc
 
-        for name, tokenizer in TOKENIZERS.items():
-            t0 = time.time()
-            bm25 = BM25Retriever(conn, tokenizer)
-            build = time.time() - t0
-            print(f"\n[{name}] index built in {build:.0f}s, "
-                  f"vocab {len(bm25.index.postings):,}")
-            print(format_result(f"  bm25 ({name})", evaluate(bm25, pairs)))
-            hybrid = HybridRetriever(dense, bm25)
-            print(format_result(f"  hybrid ({name})", evaluate(hybrid, pairs)))
-            del bm25, hybrid
+        if "--hybrid" in sys.argv:
+            enc = PrecomputedEncoder.for_issues(conn, dups, MODEL_KEY_CLEAN)
+            dense = VectorRetriever(conn, enc, MODEL_KEY_CLEAN)
+            bm25 = BM25Retriever(conn, tok_atomic, clean=True)
+            print(format_result("bm25 (clean corpus)", evaluate(bm25, pairs)))
+            print(format_result("hybrid (clean)",
+                                evaluate(HybridRetriever(dense, bm25), pairs)))
     finally:
         conn.close()

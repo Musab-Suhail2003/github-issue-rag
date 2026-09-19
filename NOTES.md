@@ -597,3 +597,85 @@ on a 4k-doc corpus). `rank_bm25` stays in `requirements.txt` as the reference
 implementation the tests validate against.
 
 Build cost on the full corpus: 91–159s per tokenizer, ~2.7GB peak RSS.
+
+---
+
+## Stage 6a — Strip template boilerplate (2026-09-19)
+
+Pulled forward from stage 6 because everything downstream trains or scores on
+this text. Same model, same corpus, same 504-pair test split — **only the input
+text differs.**
+
+### What was removed
+
+vscode's bug template appends a `System Info` table, an `A/B Experiments` flag
+dump and version headers to every report. Measured over the whole corpus:
+
+| | before | after |
+|---|---|---|
+| mean chars in the 2,000-char window | 1,327 | 623 |
+| median | 1,613 | 401 |
+| total text volume | 112.7M | 52.9M (**−53.0%**) |
+
+28.6% of issues were unchanged (hand-written, no template). 0.5% reduced to
+title only — inspected, and those bodies genuinely were all boilerplate.
+
+The extreme case: #307631's real content is *"What should the commit message
+be."* — 34 characters — followed by 2,200 characters of GPU driver strings.
+
+### The number
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| dense (raw text) | 0.1230 | 0.2123 | 0.2778 | 0.1627 |
+| **dense (boilerplate stripped)** | 0.1230 | **0.2440** | **0.3016** | **0.1747** |
+
+**+2.4 points recall@10, +3.2 recall@5, +1.2 MRR, recall@1 unchanged** — from
+deleting text, with no new model and no training.
+
+### Significance — and a correction to stage 2's rule
+
+Stage 2 recorded "differences smaller than ~4 points are not significant." **That
+rule is wrong for this comparison and needs qualifying.** It was derived from the
+standard error of a single proportion at n=504, which applies when comparing two
+*independent* samples. Here both systems answer the *same* queries, so the right
+test is McNemar's on the discordant pairs:
+
+```
+both correct        127
+both wrong          339
+raw only   (lost)    13
+clean only (gained)  25
+net +12 queries, McNemar exact two-sided p = 0.0730
+```
+
+**p = 0.073 — suggestive, not significant at 0.05.** Much closer than the ±4
+independent-sample band implied, but it does not clear the bar.
+
+Going forward: use the ±4-point band for comparing against an *external*
+baseline, and McNemar's for any A/B where the same test set is scored twice.
+Nearly every comparison in this project is the paired kind.
+
+### Kept anyway, and why that is not cherry-picking
+
+The change is adopted despite p=0.073:
+
+1. It is better or equal on **all four metrics**, never worse.
+2. The direction is consistent across recall@5, recall@10 and MRR, which a noise
+   explanation has to account for.
+3. It is a **prerequisite for stage 5b** regardless of its own effect size —
+   fine-tuning on text that is half GPU driver strings would teach the model to
+   read them.
+4. It halves storage and encode cost.
+
+If the only argument were the recall delta, p=0.073 would not justify the claim.
+The honest framing for the README is "a consistent improvement that does not
+reach significance on 504 queries," not "boilerplate stripping improves recall."
+
+### Cost note
+
+Importing the second set of 84,942 vectors took **1h22m**, versus 10m38s for the
+first. The HNSW index now holds 170k vectors and every insert walks a bigger
+graph. Worth planning for: stage 5b adds a third full set, which will be slower
+again. If re-encoding becomes routine, drop the vector index before a bulk load
+and rebuild it after.
