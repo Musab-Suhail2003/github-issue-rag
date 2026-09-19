@@ -858,3 +858,32 @@ It turned out worse than that: reranking did not merely fail to help within its
 ceiling, it actively reordered correct answers out of the top 10. But the
 framing — that the retrieval ceiling, not the ranking, was the binding
 constraint — was correct, and it is why the effort went into stage 5b first.
+
+### Failure mode found by inspection: intent is not encoded
+
+Reported query #336866 "Allow configuring the default Changes view changeset"
+retrieves #302623 "Sessions: Changes view breaks when selecting `Last Turn's
+Changes`". Same feature area and a shared distinctive phrase, but one is a
+feature request and the other a bug — not duplicates.
+
+Measured how much intent matters, over the labelled test set:
+
+| true duplicate pairs with a type label on both sides | 187 |
+|---|---|
+| same type (bug↔bug, feature↔feature) | 167 (89.3%) |
+| different type | 20 (10.7%) |
+
+Intent is a strong negative signal. Two problems with using it as a filter:
+only 187 of 2,516 pairs (7%) have both sides labelled, and neither issue in the
+example is labelled at all.
+
+Root cause is the training objective, not the features. MNRL draws negatives
+from the rest of the batch — other duplicate pairs, almost always about
+unrelated features. Those negatives are trivially easy, so the model was never
+forced to separate "same area, different intent". The distinguishing text is
+present ("Please add a user setting" vs "breaks when selecting") and unused.
+
+**Next experiment: hard-negative mining.** Mine negatives that are topically
+close but not duplicates -- nearest neighbours of each anchor that are not its
+canonical -- and train against those. This directly targets the 57.9% that never
+surfaces and the false positives like the pair above.

@@ -189,6 +189,34 @@ independent samples and was too conservative for paired A/B tests.
 
 ---
 
+## A failure you can check yourself
+
+Query [#336866](https://github.com/microsoft/vscode/issues/336866) *"Allow
+configuring the default Changes view changeset"* and the top result is
+[#302623](https://github.com/microsoft/vscode/issues/302623) *"Sessions: Changes
+view breaks when selecting `Last Turn's Changes`"*.
+
+They are **not** duplicates. One is a feature request asking for a setting; the
+other is a bug report about the view breaking. They share a feature area and the
+distinctive phrase *"Last Turn Changes"*, which is what both the embedding and
+BM25 latch onto.
+
+This is a systematic gap, and it is measurable. Among true duplicate pairs where
+both sides carry a type label, **89.3% share that type** (bug↔bug or
+feature↔feature) — so intent is a strong signal that two issues are *not*
+duplicates. But only 187 of 2,516 pairs (7%) have both sides labelled, and
+neither issue above is labelled at all, so a metadata filter would not help here.
+
+The root cause is the training objective. `MultipleNegativesRankingLoss` uses
+random in-batch negatives — other duplicate pairs, usually about entirely
+different features. Those are easy. The model was never asked to separate "same
+feature area, different intent", so it did not learn to, even though the text
+says *"Please add a user setting"* versus *"breaks when selecting"*.
+
+**The fix is hard-negative mining**: train against topically-close non-duplicates
+rather than random ones. Not implemented — recorded as the highest-value next
+experiment.
+
 ## Why recall@10 is 0.32 and not 0.9
 
 Three reasons, in order of size:
