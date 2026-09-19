@@ -679,3 +679,37 @@ first. The HNSW index now holds 170k vectors and every insert walks a bigger
 graph. Worth planning for: stage 5b adds a third full set, which will be slower
 again. If re-encoding becomes routine, drop the vector index before a bulk load
 and rebuild it after.
+
+### Operational: the vector index was costing hours, and nothing used it
+
+Bulk-importing 84,942 vectors took **10m38s** into an empty index and **1h22m**
+into one already holding 84,942 — same row count, 8× slower. HNSW insert cost
+grows with the graph already built, so the stage 5b import would have been
+worse again.
+
+Measured the fix directly:
+
+| | 8,000 inserts | projected for 84,942 |
+|---|---|---|
+| with `VECTOR INDEX` (empty table) | 9.3s | 1.6 min |
+| without the index | 1.6s | 0.3 min |
+| with the index, into a 138k-row table | — | **~82 min (observed)** |
+
+Dropped the index. A full import is now **18 seconds**, down from 1h22m, and
+retrieval is unchanged because `VectorRetriever` reads the `vec` column directly
+and scores in numpy.
+
+This is not a workaround, it is the consistent conclusion of stage 3: brute force
+is 32ms and exact, HNSW is 86ms and approximate, at this corpus size. Paying 82
+minutes per import to maintain an index that is slower and less accurate was pure
+cost. The index can be rebuilt in one statement for the README's
+production-path demonstration:
+
+```sql
+ALTER TABLE embeddings ADD VECTOR INDEX (vec) DISTANCE=cosine;
+```
+
+**To be clear about what this is not:** it is not evidence that vector indexes
+are useless. It is evidence that at 85k × 384 they lose to a brute-force matmul
+that fits in 124MB of RAM, and that index maintenance during bulk load is the
+dominant cost when it is kept anyway.

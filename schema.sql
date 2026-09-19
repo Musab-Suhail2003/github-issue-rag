@@ -76,9 +76,12 @@ CREATE TABLE IF NOT EXISTS embeddings (
   vec          VECTOR(384) NOT NULL,
   created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (issue_number, model_name),
-  -- Must match the query function. A mismatch silently full-scans instead of
-  -- erroring -- check with EXPLAIN.
-  VECTOR INDEX (vec) DISTANCE=cosine,
+  -- No VECTOR INDEX by default. Measured (stage 3): brute-force numpy is 32ms
+  -- and exact, the HNSW path 86ms and approximate, so nothing here uses it.
+  -- Keeping it cost 1h22m per bulk import because HNSW insert time grows with
+  -- the graph already built -- the same 85k rows took 10m38s into an empty
+  -- index and 1h22m into one holding 85k. Add it back for the demo with:
+  --   ALTER TABLE embeddings ADD VECTOR INDEX (vec) DISTANCE=cosine;
   CONSTRAINT fk_emb_issue FOREIGN KEY (issue_number)
     REFERENCES issues (number) ON DELETE CASCADE
 ) ENGINE=InnoDB;
