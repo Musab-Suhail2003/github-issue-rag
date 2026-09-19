@@ -1,0 +1,15 @@
+# Deployment config. The file watcher is a local-development feature: it walks
+# every imported module to enable hot reload. sentence-transformers pulls in
+# transformers, whose lazy module tree reaches vision models that import
+# torchvision -- which this app does not need and does not install. The walk
+# raises ModuleNotFoundError, Streamlit catches it, and logs a traceback on
+# every start. Turning the watcher off removes the noise and speeds cold starts.
+[server]
+fileWatcherType = "none"
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
