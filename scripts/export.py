@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import db  # noqa: E402
 from src.embed import MAX_CHARS  # noqa: E402
 
-MODEL_KEY = "bge-small-ft-dup"       # the winning retriever, stage 5b
+MODEL_KEY = "bge-small-ft-hardneg"   # stage 5c, the best retriever
 SNIPPET_CHARS = 600                  # enough to render a result card
 OUT = Path(__file__).resolve().parent.parent / "artifacts"
 
@@ -84,12 +84,13 @@ def main() -> None:
     (OUT / "manifest.json").write_text(json.dumps({
         "model": MODEL_KEY,
         "base_model": "BAAI/bge-small-en-v1.5",
+        "hub_model": "Musab6969/bge-small-vscode-dup-hardneg",
         "issues": len(numbers),
         "corpus_start": "2024-01-01",
         "snapshot_date": max(dates).strftime("%Y-%m-%d"),
         "exported_at": datetime.utcnow().strftime("%Y-%m-%d"),
-        "recall_at_10": 0.3214,
-        "mrr": 0.1871,
+        "recall_at_10": 0.3393,
+        "mrr": 0.1941,
         "test_pairs": 504,
     }, indent=1))
     print(json.dumps(json.loads((OUT / "manifest.json").read_text()), indent=1))

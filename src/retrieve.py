@@ -201,6 +201,57 @@ def tok_both(text: str) -> list[str]:
 TOKENIZERS = {"atomic": tok_atomic, "words": tok_words, "both": tok_both}
 
 
+class TitleWeightedRetriever:
+    """Score title and full text separately, then blend.
+
+    Concatenating title and body gives them equal say inside one embedding, so a
+    2,000-character body drowns a 60-character title. Stage 3's failure analysis
+    showed every rank-1 hit was a title match, which is the argument for pulling
+    the title out and weighting it explicitly.
+
+        score = alpha * cos(title) + (1 - alpha) * cos(full text)
+    """
+
+    def __init__(self, conn, encoder, full_key: str, title_key: str,
+                 alpha: float = 0.3):
+        self.alpha = alpha
+        self.full = VectorRetriever(conn, encoder, full_key)
+        # Title vectors are keyed by issue number, not text, so they are looked
+        # up positionally against the full-text matrix's ordering.
+        order = {int(n): i for i, n in enumerate(self.full.numbers)}
+        titles = np.zeros_like(self.full.matrix)
+        with db.cursor(conn) as cur:
+            cur.execute("SELECT issue_number, vec FROM embeddings WHERE model_name=%s",
+                        (title_key,))
+            while True:
+                rows = cur.fetchmany(5000)
+                if not rows:
+                    break
+                for n, v in rows:
+                    i = order.get(int(n))
+                    if i is not None:
+                        titles[i] = np.frombuffer(v, dtype="<f4")
+        self.titles = titles
+        self.encoder = encoder
+
+    def __call__(self, query_text: str, before_date: datetime, n: int) -> list[int]:
+        q = self.encoder(query_text)
+        if q is None:
+            return []
+        cutoff = int(np.searchsorted(self.full.dates, np.datetime64(before_date),
+                                     side="left"))
+        if cutoff == 0:
+            return []
+        # The query is scored against both representations with the same vector:
+        # the fine-tuned model embeds a title and a full issue into one space.
+        sims = ((1 - self.alpha) * (self.full.matrix[:cutoff] @ q)
+                + self.alpha * (self.titles[:cutoff] @ q))
+        k = min(n, cutoff)
+        top = np.argpartition(-sims, k - 1)[:k]
+        top = top[np.argsort(-sims[top])]
+        return [int(self.full.numbers[i]) for i in top]
+
+
 class BM25Index:
     """Okapi BM25 over an inverted index with the document weights precomputed.
 
@@ -353,7 +404,8 @@ if __name__ == "__main__":
     dups = [d for d, _ in pairs]
     conn = db.connect()
     try:
-        for key in (MODEL_KEY, MODEL_KEY_CLEAN, "bge-small-ft-dup"):
+        for key in (MODEL_KEY, MODEL_KEY_CLEAN, "bge-small-ft-dup",
+                    "bge-small-ft-hardneg"):
             with db.cursor(conn) as cur:
                 cur.execute("SELECT COUNT(*) FROM embeddings WHERE model_name=%s", (key,))
                 have = cur.fetchone()[0]
@@ -363,7 +415,9 @@ if __name__ == "__main__":
             enc = PrecomputedEncoder.for_issues(conn, dups, key)
             r = VectorRetriever(conn, enc, key)
             label = {MODEL_KEY: "raw text",
-                     MODEL_KEY_CLEAN: "boilerplate stripped"}.get(key, "FINE-TUNED")
+                     MODEL_KEY_CLEAN: "boilerplate stripped",
+                     "bge-small-ft-dup": "FINE-TUNED",
+                     "bge-small-ft-hardneg": "FINE-TUNED + hard negatives"}[key]
             print(format_result(f"dense ({label})", evaluate(r, pairs)))
             del r, enc
 
