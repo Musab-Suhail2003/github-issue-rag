@@ -887,3 +887,108 @@ present ("Please add a user setting" vs "breaks when selecting") and unused.
 close but not duplicates -- nearest neighbours of each anchor that are not its
 canonical -- and train against those. This directly targets the 57.9% that never
 surfaces and the false positives like the pair above.
+
+---
+
+## Stage 5c — Hard-negative mining (2026-09-19)
+
+Not in the original plan. Added after a user-reported false positive: query
+#336866 (feature request, "allow configuring the default Changes view
+changeset") retrieved #302623 (bug, "Changes view breaks when selecting Last
+Turn's Changes"). Same feature area, shared distinctive phrase, not duplicates.
+
+**Diagnosis:** `MultipleNegativesRankingLoss` draws negatives from the rest of
+the batch — other duplicate pairs, almost always about unrelated features. Those
+are trivially easy. The model was never asked to separate "same area, different
+intent".
+
+**Method:** for each training anchor, take its own nearest neighbours from ranks
+**5–60** and use 3 of them as explicit negatives. Two guards:
+
+- Ranks 1–4 are skipped: at that distance a neighbour is often a real duplicate
+  nobody linked, and training against it teaches the opposite of the goal.
+- **False-negative guard.** If A and B are both duplicates of C then A and B are
+  duplicates of each other, so B can never be A's negative. The whole duplicate
+  chain is excluded, and text equality is checked as well as issue number —
+  different numbers can carry identical text.
+
+6,000 triplets from 2,000 anchors, 2 epochs, batch 16, `max_seq_length=256`
+(p50 of the training text is 150 tokens).
+
+| retriever | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| fine-tuned (random negatives) | 0.1349 | 0.2639 | 0.3214 | 0.1871 |
+| **+ hard negatives** | 0.1329 | **0.2778** | **0.3393** | **0.1941** |
+
+**vs the raw baseline: recall@10 0.2778 → 0.3393, +22% relative, McNemar exact
+p = 0.0010** (58 gained, 27 lost, net +31).
+
+> **Correction.** An earlier note attached p = 0.0086 to this result. That test
+> measured the *plain* fine-tune (0.2778 → 0.3214). The correct test for the
+> hard-negative model is p = 0.0010 — stronger, but it had to be measured rather
+> than assumed.
+
+---
+
+## Stage 6 — Title weighting (2026-09-19)
+
+Titles encoded separately (84,942 titles, locally on CPU, ~50 min — titles
+average 13.6 tokens, so no GPU was needed). Scored as
+`alpha * cos(title) + (1 - alpha) * cos(full text)`.
+
+| alpha | recall@1 | recall@5 | recall@10 | MRR |
+|---|---|---|---|---|
+| 0.0 (full text only) | 0.1329 | 0.2778 | 0.3393 | 0.1941 |
+| **0.15** | 0.1409 | **0.2817** | **0.3492** | **0.2002** |
+| 0.30 | **0.1429** | 0.2698 | 0.3373 | 0.1963 |
+| 0.45 | 0.1409 | 0.2758 | 0.3333 | 0.1932 |
+| 0.60 | 0.1349 | 0.2599 | 0.3155 | 0.1828 |
+| 0.80 | 0.1230 | 0.2440 | 0.2937 | 0.1728 |
+| 1.00 (title only) | 0.1071 | 0.2143 | 0.2778 | 0.1529 |
+
+Best is **alpha = 0.15, recall@10 0.3492** — titles were underweighted, but only
+slightly. The curve rises to a single peak then declines monotonically, which is
+the shape of a real effect rather than noise.
+
+**Not significant, and not shipped.** McNemar on recall@10 vs alpha=0:
+9 gained, 4 lost, net +5, **p = 0.2668**. Shipping it costs a second 124MB
+embedding table and 60% more query latency (31ms → 50ms) for a difference that
+cannot be distinguished at n=504. Measured, reported, declined.
+
+Incidental finding worth keeping: **title-only retrieval scores recall@10
+0.2778 — identical to the original off-the-shelf baseline on full text.** A
+13-token title carries as much signal as a generic embedding of the entire
+issue.
+
+---
+
+## Stage 9 — Triage tools (2026-09-19)
+
+Three tools over the retrieval stack: `search_duplicates`, `fetch_issue`,
+`suggest_labels`. The agent loop (Anthropic SDK `tool_runner`, `claude-opus-5`,
+adaptive thinking) is **code-complete but never executed** — Claude Pro is a
+claude.ai subscription and does not include API access, and separate API billing
+was declined. Stated plainly rather than implied to work.
+
+`suggest_labels` is kNN over the existing embeddings, not an LLM prompt: the 25
+nearest issues vote for their labels weighted by cosine similarity, time-filtered
+so labels applied after the query cannot leak in. That makes it scoreable against
+the 627 real labels in the corpus, so stage 9 produces a number like every other
+stage and needs no API key.
+
+| | n | precision | recall | F1 | any correct |
+|---|---|---|---|---|---|
+| all labels | 252 | 0.2895 | 0.4737 | 0.3594 | 0.627 |
+| **content labels only** | **56** | **0.4783** | 0.4936 | **0.4858** | **0.786** |
+
+Filtering vscode's workflow labels (the `*` prefix, plus `info-needed`,
+`triage-needed`, `verified`, ...) nearly doubles precision — suggesting
+"*duplicate" as a *label* for a new issue is circular, describing what triage did
+rather than what the issue is about.
+
+**But the denominator changes**: only 56 of 504 test issues carry a content label
+at all. The unfiltered row inflates recall (`info-needed` is trivially
+predictable) and deflates precision; the filtered row is the useful task on a
+much smaller, noisier sample. Both are reported because neither alone is honest.
+
+Shipped into the Streamlit UI, where it needs no API key.

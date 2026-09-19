@@ -19,10 +19,10 @@ of the seven things I tried made results *worse*, and those are in the table too
 |---|---|---|---|---|
 | random baseline | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
 | off-the-shelf embeddings | 0.1230 | 0.2123 | 0.2778 | 0.1627 |
-| **final system** | **0.1349** | **0.2639** | **0.3214** | **0.1871** |
+| **final system** | **0.1329** | **0.2778** | **0.3393** | **0.1941** |
 
-**+4.4 points of recall@10 over the baseline, +16% relative** (McNemar exact,
-p = 0.0086 against the raw-text baseline).
+**+6.2 points of recall@10 over the baseline, +22% relative** (McNemar exact,
+p = 0.0010 against the raw-text baseline).
 
 Measured on **504 maintainer-marked duplicate pairs** the model never saw, with a
 time filter so only issues that existed when each query was filed are searchable.
@@ -45,10 +45,12 @@ Every row is the same 504-pair test split. **Bold is the best in each column.**
 | 7 | dense, template boilerplate stripped | 0.1230 | 0.2440 | 0.3016 | 0.1747 |
 | 8 | BM25, boilerplate stripped | 0.0694 | 0.1369 | 0.1746 | 0.0993 |
 | 9 | field-aware hybrid (dense-clean + BM25-raw) | **0.1369** | 0.2321 | 0.2817 | 0.1779 |
-| 10 | **dense, fine-tuned on duplicate pairs** | 0.1349 | **0.2639** | **0.3214** | **0.1871** |
+| 10 | dense, fine-tuned on duplicate pairs | 0.1349 | 0.2639 | 0.3214 | 0.1871 |
 | 11 | fine-tuned dense + BM25 (RRF) | 0.1310 | 0.2381 | 0.3016 | 0.1808 |
 | 12 | fine-tuned + `bge-reranker-base` rerank | 0.1032 | 0.1944 | 0.2520 | 0.1447 |
 | 13 | fine-tuned + `bge-reranker-v2-m3` rerank | 0.0992 | 0.2044 | 0.2877 | 0.1479 |
+| 14 | **+ hard-negative mining** | 0.1329 | **0.2778** | **0.3393** | **0.1941** |
+| 15 | + title weighting (α=0.15, not shipped) | **0.1409** | 0.2817 | 0.3492 | 0.2002 |
 
 Rows 12–13 are scored against the same candidate lists, from the fine-tuned
 retriever at depth 50.
@@ -106,8 +108,8 @@ enough to pay for the dilution.
 
 | reranker | Δ recall@10 | McNemar p |
 |---|---|---|
-| `bge-reranker-base` (278M) | −6.9 | **0.0003** |
-| `bge-reranker-v2-m3` (568M) | −3.4 | 0.068 |
+| `bge-reranker-base` (278M) | −6.7 | **0.0003** |
+| `bge-reranker-v2-m3` (568M) | −3.2 | 0.068 |
 
 See above for why. The obvious fix — fine-tune the cross-encoder on the same
 duplicate pairs — was not tried, and is recorded as the next experiment rather
@@ -188,6 +190,52 @@ a ±4-point band from the standard error of a proportion; that applies to
 independent samples and was too conservative for paired A/B tests.
 
 ---
+
+### ✅ Hard-negative mining (+1.8 recall@10) — found by a user report
+
+A reported false positive drove this. Query #336866 (*feature request*) returned
+#302623 (*bug*) — same feature area, shared phrase, not duplicates.
+
+The cause was the training objective: `MultipleNegativesRankingLoss` draws
+negatives from the rest of the batch, which are almost always about unrelated
+features. Trivially easy. The model was never asked to separate "same area,
+different intent."
+
+Re-trained with negatives mined from each anchor's **own nearest neighbours**
+(ranks 5–60), with a false-negative guard: if A and B are both duplicates of C
+then A and B are duplicates of *each other*, so the whole chain is excluded.
+Recall@10 0.3214 → **0.3393**.
+
+### ❌ Title weighting — measured, then declined
+
+Titles carry disproportionate signal (every rank-1 hit at baseline was a title
+match), but they sit inside one concatenated embedding where a 2,000-character
+body drowns a 60-character title. Scoring
+`α·cos(title) + (1−α)·cos(full text)` and sweeping α:
+
+| α | 0.0 | **0.15** | 0.3 | 0.45 | 0.6 | 0.8 | 1.0 |
+|---|---|---|---|---|---|---|---|
+| recall@10 | 0.3393 | **0.3492** | 0.3373 | 0.3333 | 0.3155 | 0.2937 | 0.2778 |
+
+A single clean peak at α=0.15 — the shape of a real effect. But **p = 0.2668**
+(9 gained, 4 lost), and shipping it costs a second 124MB embedding table and 60%
+more latency. Measured, reported, not shipped.
+
+One incidental result worth keeping: **title-only retrieval (α=1.0) scores
+0.2778 — identical to off-the-shelf embeddings on the full text.** A 13-token
+title carries as much signal as a generic embedding of the entire issue.
+
+### Triage tools, and one that is measured
+
+`search_duplicates`, `fetch_issue`, `suggest_labels`. The LLM orchestration loop
+is code-complete but **never executed** — it needs paid API access, which was
+declined for a portfolio project. Said plainly rather than implied to work.
+
+`suggest_labels` is deliberately kNN over the same embeddings rather than an LLM
+prompt, which makes it scoreable against the 627 real labels in the corpus:
+**F1 0.49, and 79% of issues get at least one correct label** (content labels,
+n=56). Filtering workflow labels like `*duplicate` and `info-needed` nearly
+doubles precision — suggesting "this is a duplicate" as a label is circular.
 
 ## A failure you can check yourself
 

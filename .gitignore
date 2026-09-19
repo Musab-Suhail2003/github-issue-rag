@@ -26,3 +26,6 @@ INTERVIEW.md
 
 # space/ is assembled by hand for reference; deployment is Streamlit Cloud
 space/
+
+# generated: contains INTERVIEW.md, must not reach the public repo
+issue-rag-notes.pdf
