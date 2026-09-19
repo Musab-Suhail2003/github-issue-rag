@@ -8,8 +8,8 @@ claim in it is measured**. Ground truth comes from maintainer-marked duplicates,
 so retrieval quality is a number on a held-out test set, not an assertion. Three
 of the seven things I tried made results *worse*, and those are in the table too.
 
-**Live demo:** [Streamlit Community Cloud](https://share.streamlit.io) · artifacts on [HF datasets](https://huggingface.co/datasets/Musab6969/vscode-issue-rag-artifacts) · **Model:**
-[`Musab6969/bge-small-vscode-dup`](https://huggingface.co/Musab6969/bge-small-vscode-dup)
+**Live demo:** **[issue-rag-musab.streamlit.app](https://issue-rag-musab.streamlit.app/)** · **Model:**
+[`Musab6969/bge-small-vscode-dup-hardneg`](https://huggingface.co/Musab6969/bge-small-vscode-dup-hardneg)
 
 ---
 
