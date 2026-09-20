@@ -331,6 +331,9 @@ python -m src.retrieve        # the ablation numbers
 streamlit run app.py
 ```
 
+The GPU steps are in [`notebooks/`](notebooks/) — encoding, both fine-tunes, and
+the reranker scoring, each with the failure modes that cost time the first time.
+
 `NOTES.md` is the full experiment log — every number above, the configuration
 that produced it, and what was learned from the ones that failed.
 
